@@ -1,0 +1,18 @@
+# Ignore everything by default
+*
+
+# Core pipeline files
+!.gitignore
+!environment.yaml
+!example_config_advanced.yaml
+!example_config_minimal.yaml
+!infer.py
+!plot.R
+!predict.py
+!run_boost_shap_gii.sh
+!shap_utils.py
+!train.py
+!utils.py
+!README.md
+!INPUT_SPECIFICATION.md
+!check_env.py

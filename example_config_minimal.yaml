@@ -1,0 +1,57 @@
+# ---Minimal Configuration for Global Importance Index with Boosted SHAP---
+# Only mandatory fields are included. All omitted fields will be auto-filled
+# with data-driven defaults. See example_config_advanced.yaml for full control.
+
+paths:
+  input_data: "/path/to/your/data.csv"
+  output_dir: "/path/to/your/output_run/"
+
+features:
+  continuous_groups:
+    - pattern: "age_index"
+      match_mode: "exact"
+      exclude: []
+
+    - pattern: "score_pre_cluster"
+      match_mode: "substring"
+      exclude: []
+
+  ordinal_groups:
+    - pattern: "education_level"
+      match_mode: "substring"
+      exclude: ["code"]
+      levels:
+        - "Less than high school"
+        - "High school or GED"
+        - "Some college"
+        - "Postsecondary certificate"
+        - "Associate degree"
+        - "Bachelor's degree"
+        - "Master's degree"
+        - "Doctoral or professional degree"
+
+    - pattern: "item_pre"
+      match_mode: "substring"
+      exclude: ["cluster", "total", "impairment","event","version"]
+      levels: [0, 1, 2, 3, 4]
+
+    - pattern: "symptom_pre"
+      match_mode: "substring"
+      exclude: ["cluster", "total","event", "version"]
+      levels: [0, 1, 2, 3, 4, 5]
+
+  nominal_groups:
+    - pattern: "sex"
+      match_mode: "exact"
+      exclude: []
+
+    - pattern: "ethnicity"
+      match_mode: "exact"
+      exclude: []
+
+    - pattern: "group"
+      match_mode: "substring"
+      exclude: ["thq","code"]
+
+modeling:
+  outcome: "outcome_total"    # String for single outcome; list for multi_regression (e.g., ["y1", "y2"])

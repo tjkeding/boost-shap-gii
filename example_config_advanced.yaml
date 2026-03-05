@@ -1,0 +1,133 @@
+# ---Example Configuration for Global Importance Index with Boosted SHAP---
+
+execution:
+  n_jobs: 45          # Global core limit (number of CPUs for parallel processing)
+  random_seed: 42     # Master seed
+
+paths:
+  input_data: "/path/to/your/data.csv"
+  output_dir: "/path/to/your/output_run/"
+
+features:
+  continuous_groups:
+    - pattern: "age_index"
+      match_mode: "exact"
+      exclude: []
+
+    - pattern: "score_pre_cluster"
+      match_mode: "substring"
+      exclude: []
+
+  ordinal_groups:
+    - pattern: "education_level"
+      match_mode: "substring"
+      exclude: ["code"]
+      levels:
+        - "Less than high school"
+        - "High school or GED"
+        - "Some college"
+        - "Postsecondary certificate"
+        - "Associate degree"
+        - "Bachelor's degree"
+        - "Master's degree"
+        - "Doctoral or professional degree"
+
+    - pattern: "item_pre"
+      match_mode: "substring"
+      exclude: ["cluster", "total", "impairment","event","version"]
+      levels: [0, 1, 2, 3, 4]
+
+    - pattern: "symptom_pre"
+      match_mode: "substring"
+      exclude: ["cluster", "total","event", "version"]
+      levels: [0, 1, 2, 3, 4, 5]
+
+  nominal_groups:
+    - pattern: "sex"
+      match_mode: "exact"
+      exclude: []
+
+    - pattern: "ethnicity"
+      match_mode: "exact"
+      exclude: []
+
+    - pattern: "group"
+      match_mode: "substring"
+      exclude: ["thq","code"]
+
+modeling:
+  outcome: "outcome_total"    # String for single outcome; list for multi_regression (e.g., ["y1", "y2"])
+  cv_folds: 10
+
+  # Task type (optional — auto-detected from scoring if omitted)
+  # Options: "regression", "binary_classification", "multiclass_classification", "multi_regression"
+  # task_type: "regression"
+
+  # Optimization metric for TRAINING
+  # Regression options: "RMSE", "MAE", "Huber", "Quantile"
+  # Multi-regression option: "MultiRMSE"
+  # Binary classification options: "Logloss", "CrossEntropy"
+  # Multiclass classification options: "MultiClass", "MultiClassOneVsAll"
+  loss_function: "RMSE"
+
+  tuning:
+    n_iter: 500
+
+    # Optimization metric for TUNING
+    # Regression options: "neg_rmse", "neg_mae", "r2"
+    # Binary classification options: "roc_auc", "log_loss", "accuracy", "f1"
+    # Multiclass classification options: "balanced_accuracy", "f1_weighted", "roc_auc_ovr"
+    scoring: "neg_rmse"
+    inner_cv_folds: 5
+    early_stopping_rounds: 250
+
+    search_space:
+      iterations:
+        low: 500
+        high: 10000
+      learning_rate:
+        low: 0.00001
+        high: 0.3
+        log: true
+      depth:
+        low: 2
+        high: 10
+      l2_leaf_reg:
+        low: 0.001
+        high: 100.0
+        log: true
+      random_strength:
+        low: 0.001
+        high: 10.0
+        log: true
+      min_data_in_leaf:
+        low: 1
+        high: 50
+      bagging_temperature:
+        low: 0.1
+        high: 1.0
+        log: false
+      border_count:
+        low: 32
+        high: 255
+      one_hot_max_size:
+        low: 2
+        high: 25
+      colsample_bylevel:
+        low: 0.05
+        high: 1.0
+
+shap:
+  output_microdata_n: 25       # Extra non-significant features to save microdata for (R plotting)
+
+  bootstrapping:
+    n_boot: 10000         # Number of bootstrap iterations
+    alpha: 0.05           # Significance level (for CIs and FDR)
+    fdr_correct: true     # Use FDR corrected q (instead of p) for significance testing
+    stab_thresh: 2        # Significance level for stability (2 = twice as much signal as noise)
+    output_boots_n: 25    # Extra non-significant features to save bootstraps for
+
+  splines:
+    n_knots: 4            # Knots for 1D/2D splines (smoothness)
+    degree: 3             # Polynomial degree (3=Cubic)
+    discrete_threshold: 15 # Number of data points within a "spline knot" to treat as continuous (> 15)

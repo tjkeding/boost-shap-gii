@@ -1,0 +1,43 @@
+# ============================================================================
+# Conda environment for boost_shap_gii
+# ============================================================================
+#
+# Create:  conda env create -f environment.yaml
+# Activate: conda activate boost_shap_gii
+# Update:  conda env update -f environment.yaml --prune
+#
+# ============================================================================
+
+name: boost_shap_gii
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python>=3.8
+  - numpy
+  - pandas
+  - pyyaml
+  - scikit-learn
+  - scipy
+  - statsmodels
+  - joblib
+  - pyarrow
+  - pip
+  - pip:
+    - catboost
+    - optuna
+
+# ============================================================================
+# R Dependencies (installed separately via R / install.packages)
+# ============================================================================
+# Required R packages for plot.R:
+#   ggplot2, dplyr, arrow, tidyr, foreach, doParallel,
+#   gridExtra, splines, stringr, yaml
+#
+# Install in R:
+#   install.packages(c("ggplot2", "dplyr", "arrow", "tidyr", "foreach",
+#                      "doParallel", "gridExtra", "stringr", "yaml"))
+#   # Note: splines, grid, grDevices ship with base R
+# ============================================================================
