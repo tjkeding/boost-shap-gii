@@ -1,14 +1,14 @@
 # ============================================================================
-# Conda environment for boost_shap_gii
+# Conda environment for boost-shap-gii
 # ============================================================================
 #
 # Create:  conda env create -f environment.yaml
-# Activate: conda activate boost_shap_gii
+# Activate: conda activate boost-shap-gii
 # Update:  conda env update -f environment.yaml --prune
 #
 # ============================================================================
 
-name: boost_shap_gii
+name: boost-shap-gii
 
 channels:
   - conda-forge

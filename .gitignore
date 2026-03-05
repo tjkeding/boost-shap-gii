@@ -9,7 +9,7 @@
 !infer.py
 !plot.R
 !predict.py
-!run_boost_shap_gii.sh
+!run_boost-shap-gii.sh
 !shap_utils.py
 !train.py
 !utils.py

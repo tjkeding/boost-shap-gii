@@ -1,4 +1,4 @@
-# boost_shap_gii
+# boost-shap-gii
 
 **Global Importance Index via Boosted SHAP**
 
@@ -11,7 +11,7 @@ A config-driven machine learning pipeline combining CatBoost and SHAP interactio
 ### 1. Environment Setup
 ```bash
 conda env create -f environment.yaml
-conda activate boost_shap_gii
+conda activate boost-shap-gii
 ```
 *Note: Install R packages separately as listed in environment.yaml.*
 
@@ -27,12 +27,12 @@ The orchestrator automatically verifies your environment and data paths before s
 
 **Training & SHAP Analysis:**
 ```bash
-bash run_boost_shap_gii.sh train config.yaml OUTCOME_RANGE NEGATE_SHAP Y_AXIS_LABEL
+bash run_boost-shap-gii.sh train config.yaml OUTCOME_RANGE NEGATE_SHAP Y_AXIS_LABEL
 ```
 
 **Inference on New Data:**
 ```bash
-bash run_boost_shap_gii.sh infer train_config.yaml new_data.csv sub_dir OUTCOME_RANGE NEGATE_SHAP Y_AXIS_LABEL
+bash run_boost-shap-gii.sh infer train_config.yaml new_data.csv sub_dir OUTCOME_RANGE NEGATE_SHAP Y_AXIS_LABEL
 ```
 
 ---

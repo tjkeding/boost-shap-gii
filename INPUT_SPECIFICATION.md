@@ -1,13 +1,13 @@
 # INPUT_SPECIFICATION.md
 
-## Technical Reference for boost_shap_gii
+## Technical Reference for boost-shap-gii
 
 ### 1. Pipeline Stages
 
 #### Stage 0: Pre-flight (`check_env.py`)
 - **Python Verification**: Imports `catboost`, `optuna`, `shap`, `pyarrow`, `sklearn`, `scipy`, `pandas`, `yaml`.
 - **R Verification**: Checks `ggplot2`, `dplyr`, `arrow`, `tidyr`, `foreach`, `doParallel`, `gridExtra`, `stringr`, `yaml`.
-- **Guard Logic**: Aborts `run_boost_shap_gii.sh` if any dependency is missing.
+- **Guard Logic**: Aborts `run_boost-shap-gii.sh` if any dependency is missing.
 
 #### Stage 1: Data Ingestion
 - **Formats**: `.csv` or `.parquet`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent Dataset Inference for boost_shap_gii"""
+"""Independent Dataset Inference for boost-shap-gii"""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Apply trained boost_shap_gii models to an independent dataset"
+        description="Apply trained boost-shap-gii models to an independent dataset"
     )
     parser.add_argument("--config", required=True,
                         help="Path to the training run's resolved_config.yaml")

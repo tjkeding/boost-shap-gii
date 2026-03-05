@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-language dependency verification for boost_shap_gii."""
+"""Cross-language dependency verification for boost-shap-gii."""
 
 import sys
 import subprocess

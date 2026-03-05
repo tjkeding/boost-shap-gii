@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Model Tuning and Training for boost_shap_gii pipeline."""
+"""Model Tuning and Training for boost-shap-gii pipeline."""
 
 from __future__ import annotations
 

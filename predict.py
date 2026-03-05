@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prediction Inference for boost_shap_gii (training set)"""
+"""Prediction Inference for boost-shap-gii (training set)"""
 
 from __future__ import annotationsß
 

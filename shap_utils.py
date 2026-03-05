@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SHAP Analysis Library for boost_shap_gii
+SHAP Analysis Library for boost-shap-gii
 - Tier 1 (Singleton) & Tier 2 (Interaction) Analysis
 - Decomposes SHAP into M (Magnitude) and V (Variability)
 - V-Calculation: Hybrid Approach (Splines vs Group Means) based on Type/Resolution

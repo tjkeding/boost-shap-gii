@@ -1,4 +1,4 @@
-"""Shared Utilities for boost_shap_gii pipeline."""
+"""Shared Utilities for boost-shap-gii pipeline."""
 
 from __future__ import annotations
 
