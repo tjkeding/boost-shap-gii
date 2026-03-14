@@ -2,7 +2,7 @@
 
 **Global Importance Index via Boosted SHAP**
 
-A config-driven machine learning pipeline combining CatBoost and SHAP interaction values to produce statistically rigorous Global Importance Indices (GII).
+A YAML-driven predictive modeling pipeline combining CatBoost and SHAP interaction values to produce Global Importance Indices (GII).
 
 ---
 
