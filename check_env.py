@@ -6,7 +6,8 @@ import subprocess
 import importlib
 
 PYTHON_DEPS = [
-    "catboost", "optuna", "shap", "pyarrow", "sklearn", "scipy", "pandas", "yaml"
+    "catboost", "optuna", "shap", "pyarrow", "sklearn", "scipy",
+    "pandas", "yaml", "joblib", "statsmodels"
 ]
 
 R_DEPS = [
@@ -55,7 +56,8 @@ def check_r():
 
     if missing:
         print(f"[ERROR] Missing R packages: {', '.join(missing)}")
-        print(f"[HINT]  Install in R: install.packages(c({', '.join([f'\"{m}\"' for m in missing])}))")
+        quoted = ', '.join(f'"{m}"' for m in missing)
+        print(f"[HINT]  Install in R: install.packages(c({quoted}))")
         return False
     print("   - All R dependencies found.")
     return True

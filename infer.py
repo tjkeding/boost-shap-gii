@@ -153,7 +153,8 @@ def main():
     ord_feats = [c for c, t in feature_types.items() if t == 'ordinal']
     nom_feats = [c for c, t in feature_types.items() if t == 'nominal']
 
-    # A. Cast Nominals (String -> Category)
+    # A. Cast Nominals (String -> Category).
+    # NaN -> "__NA__" (literal string level). See train.py and README for rationale.
     for c in nom_feats:
         X[c] = df_raw[c].fillna("__NA__").astype(str).astype("category")
 
@@ -170,13 +171,24 @@ def main():
         unique_vals = df_raw[c].dropna().unique()
         unknowns = [v for v in unique_vals if v not in levels]
         if unknowns:
+            # Tier 1: unique-value fraction (hard error if >50% of distinct values are unknown)
             unknown_frac = len(unknowns) / len(unique_vals)
             if unknown_frac > 0.5:
                 raise ValueError(
                     f"Feature '{c}': {unknown_frac:.0%} of unique values not in YAML levels "
                     f"{levels}. Check for case mismatches or missing level definitions."
                 )
-            print(f"[WARNING] Feature '{c}': {len(unknowns)} value(s) not in YAML levels: {unknowns}")
+            print(f"[WARNING] Feature '{c}': {len(unknowns)} unique value(s) not in YAML levels: {unknowns}")
+            # Tier 2: observation-level fraction (loud warning if >10% of observations are unknown)
+            obs_vals = df_raw[c].dropna()
+            n_unknown_obs = sum(v not in levels for v in obs_vals)
+            obs_frac = n_unknown_obs / len(obs_vals) if len(obs_vals) > 0 else 0.0
+            if obs_frac > 0.10:
+                print(
+                    f"[WARNING] Feature '{c}': {obs_frac:.1%} of non-missing observations "
+                    f"({n_unknown_obs}/{len(obs_vals)}) have values not in YAML levels. "
+                    f"This may indicate systematic data quality issues."
+                )
 
         cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
         X[c] = df_raw[c].astype(cat_type).cat.codes.astype("Int64")

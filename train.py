@@ -47,9 +47,12 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 # -----------------------------------------------------------------------------
 
 class FeatureSelector:
-    """
-    Parses the new YAML 'features' block to select and classify columns
-    from a clean dataframe with Strict Conflict Detection.
+    """Parse the YAML 'features' block and classify columns with conflict detection.
+
+    Processes `continuous_groups`, `ordinal_groups`, and `nominal_groups` from the
+    config. Raises `ValueError` if any column is claimed by more than one feature type.
+    Column ordering in `final_columns` is deterministic (sorted), ensuring consistent
+    train/predict/infer alignment.
     """
     def __init__(self, config_features):
         self.config = config_features
@@ -57,7 +60,7 @@ class FeatureSelector:
         self.feature_metadata = {}   # {col_name: {levels: [], ...}}
 
     def _match(self, col_name, pattern, mode):
-        """Helper to handle match_mode logic."""
+        """Return True if col_name matches pattern under the given mode."""
         if mode == "exact":
             return col_name == pattern
         elif mode == "prefix":
@@ -68,9 +71,22 @@ class FeatureSelector:
         return pattern in col_name
 
     def fit(self, all_columns):
-        """
-        Scans all_columns against the config.
-        Raises ValueError if a column is claimed by multiple groups.
+        """Scan all_columns against the config and assign feature types.
+
+        Parameters
+        ----------
+        all_columns : list[str]
+            All candidate column names from the input DataFrame (outcomes excluded).
+
+        Returns
+        -------
+        list[str]
+            Sorted list of selected feature names.
+
+        Raises
+        ------
+        ValueError
+            If any column is claimed by more than one feature type.
         """
         # We process groups in this order, but we track claims globally to detect conflicts
         groups_map = {
@@ -142,7 +158,7 @@ class FeatureSelector:
         return self.final_columns
 
     def get_feature_lists(self):
-        """Returns lists of names for CatBoost: [continuous, ordinal, nominal]"""
+        """Return sorted (continuous, ordinal, nominal) feature name lists for CatBoost."""
         con = [c for c, t in self.selected_features.items() if t == 'continuous']
         ord_ = [c for c, t in self.selected_features.items() if t == 'ordinal']
         nom = [c for c, t in self.selected_features.items() if t == 'nominal']
@@ -153,7 +169,10 @@ class FeatureSelector:
 # -----------------------------------------------------------------------------
 
 def report_missingness(df: pd.DataFrame, features: list, outcome: str, run_dir: str):
-    """Report per-feature missingness rates and save to CSV."""
+    """Compute and save per-feature missingness rates to `missingness_report.csv`.
+
+    Features with > 10% missing rate are individually flagged with a WARNING.
+    """
     cols = [c for c in features + [outcome] if c in df.columns]
     miss_rates = df[cols].isnull().mean().sort_values(ascending=False)
     miss_counts = df[cols].isnull().sum().reindex(miss_rates.index)
@@ -187,12 +206,38 @@ def run_optuna_tuning(
     cat_features: List[str],
     task: str,
     config: Dict,
-    n_jobs: int
+    n_jobs: int,
+    fold_idx: int = 0,
 ) -> Tuple[Dict[str, Any], int]:
-    """
-    Run Optuna Hyperparameter Tuning using search space from YAML.
-    Returns (best_params, tuned_iterations) where tuned_iterations is
-    the mean best_iteration_ across inner CV folds of the winning trial.
+    """Run Optuna TPE hyperparameter tuning on the inner CV.
+
+    The inner CV seed is offset by `fold_idx + 1` relative to the outer seed,
+    ensuring inner and outer folds use distinct random split patterns. The TPESampler
+    seed is set identically to the inner CV seed for full consistency.
+
+    Parameters
+    ----------
+    X_train : pd.DataFrame
+        Training features for the current outer fold.
+    y_train : pd.Series or pd.DataFrame
+        Training labels (Series for single-output, DataFrame for multi_regression).
+    cat_features : list[str]
+        Nominal (categorical) feature names for CatBoost.
+    task : str
+        Task type (one of VALID_TASK_TYPES).
+    config : dict
+        Full pipeline config (read from YAML).
+    n_jobs : int
+        CPU threads for CatBoost.
+    fold_idx : int
+        Outer fold index (0-based). Used to offset the inner CV seed.
+
+    Returns
+    -------
+    best_params : dict
+        Winning hyperparameter set from Optuna (excludes `iterations`).
+    tuned_iterations : int
+        Mean `best_iteration_` across inner CV folds for the winning trial + 1.
     """
     tuning_cfg = config["modeling"]["tuning"]
     n_trials = tuning_cfg["n_iter"]
@@ -209,11 +254,13 @@ def run_optuna_tuning(
     inner_cv_folds = tuning_cfg["inner_cv_folds"]
     seed = config["execution"]["random_seed"]
 
-    inner_cv = KFold(n_splits=inner_cv_folds, shuffle=True, random_state=seed)
+    # Offset inner CV seed by fold_idx + 1 so inner and outer folds use distinct seeds.
+    inner_seed = seed + fold_idx + 1
+    inner_cv = KFold(n_splits=inner_cv_folds, shuffle=True, random_state=inner_seed)
     # For stratified splitting, need 1D y with limited unique values
     y_for_stratify = y_train if isinstance(y_train, pd.Series) else y_train.iloc[:, 0]
     if is_classification(task) and y_for_stratify.nunique() < 20:
-        inner_cv = StratifiedKFold(n_splits=inner_cv_folds, shuffle=True, random_state=seed)
+        inner_cv = StratifiedKFold(n_splits=inner_cv_folds, shuffle=True, random_state=inner_seed)
 
     def objective(trial):
         # 1. Parse YAML Search Space dynamically
@@ -278,8 +325,8 @@ def run_optuna_tuning(
         trial.set_user_attr("mean_best_iter", int(np.mean(best_iters)) + 1)
         return np.mean(scores)
 
-    # Run Study
-    sampler = TPESampler(seed=seed)
+    # Run Study — use inner_seed for full consistency with inner CV
+    sampler = TPESampler(seed=inner_seed)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     study.optimize(objective, n_trials=n_trials, n_jobs=1)
 
@@ -298,7 +345,7 @@ def main():
 
     # 1. Setup
     config = load_config(args.config)
-    run_dir = config["paths"]["output_dir"] # CHANGED: Uses correct path key
+    run_dir = config["paths"]["output_dir"]
     os.makedirs(run_dir, exist_ok=True)
 
     # 2. Load Data
@@ -395,7 +442,10 @@ def main():
     else:
         y = df_raw[outcome_cols[0]].copy()
 
-    # A. Force Nominal to String -> Category
+    # A. Force Nominal to String -> Category.
+    # NaN is filled with the literal string "__NA__" before encoding. CatBoost treats
+    # "__NA__" as a valid category level, allowing the model to learn whether missingness
+    # is predictive. This is an implicit informativeness assumption — see README.
     for c in nom_feats:
         X[c] = X[c].fillna("__NA__").astype(str).astype("category")
 
@@ -413,13 +463,24 @@ def main():
         unique_vals = X[c].dropna().unique()
         unknowns = [v for v in unique_vals if v not in levels]
         if unknowns:
+            # Tier 1: unique-value fraction (hard error if >50% of distinct values are unknown)
             unknown_frac = len(unknowns) / len(unique_vals)
             if unknown_frac > 0.5:
                 raise ValueError(
                     f"Feature '{c}': {unknown_frac:.0%} of unique values not in YAML levels "
                     f"{levels}. Check for case mismatches or missing level definitions."
                 )
-            print(f"[WARNING] Feature '{c}': {len(unknowns)} value(s) not in YAML levels: {unknowns}")
+            print(f"[WARNING] Feature '{c}': {len(unknowns)} unique value(s) not in YAML levels: {unknowns}")
+            # Tier 2: observation-level fraction (loud warning if >10% of observations are unknown)
+            obs_vals = X[c].dropna()
+            n_unknown_obs = sum(v not in levels for v in obs_vals)
+            obs_frac = n_unknown_obs / len(obs_vals) if len(obs_vals) > 0 else 0.0
+            if obs_frac > 0.10:
+                print(
+                    f"[WARNING] Feature '{c}': {obs_frac:.1%} of non-missing observations "
+                    f"({n_unknown_obs}/{len(obs_vals)}) have values not in YAML levels. "
+                    f"This may indicate systematic data quality issues."
+                )
 
         # Create ordered categorical then code
         cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
@@ -537,7 +598,7 @@ def main():
         print("  > Tuning hyperparameters (Phase 1: Clean)...")
         # Note: CatBoost handles Ordinals as numeric if we don't list them in cat_features.
         # We ONLY pass nominals to cat_features argument.
-        best_params, tuned_iters = run_optuna_tuning(X_train, y_train, nom_feats, task, config, n_jobs)
+        best_params, tuned_iters = run_optuna_tuning(X_train, y_train, nom_feats, task, config, n_jobs, fold_idx=fold_idx)
         print(f"  > Best Params: {best_params}")
         print(f"  > Tuned Iterations (inner CV mean): {tuned_iters}")
 
@@ -652,15 +713,28 @@ def main():
         shadow_nom_feats = [f"shadow_{c}" for c in nom_feats]
         full_cat_features = nom_feats + shadow_nom_feats
 
-        # 4. Train Shadow Model (No Re-tuning, use best_params)
+        # 4. Train Shadow Model with early stopping on outer validation fold.
+        # Use tuned_iters * 2 as ceiling — the shadow model trains on 2p features
+        # and requires more iterations to converge. Early stopping on X_val_full
+        # is data-adaptive and introduces no leakage: shadow outputs are never
+        # used for predictive evaluation, only for SHAP noise calibration.
         pool_train_full = Pool(X_train_full, y_train, cat_features=full_cat_features)
+        pool_val_full = Pool(X_val_full, y_val, cat_features=full_cat_features)
+
+        shadow_params = best_params.copy()
+        shadow_params["iterations"] = tuned_iters * 2  # ceiling, not fixed count
 
         if is_regression(task):
-            model_shadow = CatBoostRegressor(**best_params)
+            model_shadow = CatBoostRegressor(**shadow_params)
         else:
-            model_shadow = CatBoostClassifier(**best_params)
+            model_shadow = CatBoostClassifier(**shadow_params)
 
-        model_shadow.fit(pool_train_full, verbose=False)
+        model_shadow.fit(
+            pool_train_full,
+            eval_set=pool_val_full,
+            early_stopping_rounds=int(config["modeling"]["tuning"]["early_stopping_rounds"]),
+            verbose=False,
+        )
 
         # 5. Save Shadow Model
         shadow_model_path = os.path.join(run_dir, f"shadow_model_fold_{fold_idx}.cbm")

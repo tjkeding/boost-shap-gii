@@ -187,18 +187,23 @@ def _default_inner_cv_folds(n: int, outer_folds: int) -> int:
 
 
 def _default_search_space(n: int, p: int) -> Dict[str, Any]:
-    """Data-driven hyperparameter search space. Always 10 parameters."""
+    """Build data-driven CatBoost hyperparameter search space (10 parameters).
+
+    Notable bounds:
+    - `depth.high`: floored at 3 to guarantee at least a [2, 3] range even for n < 20.
+    - `one_hot_max_size`: fixed [2, 25], independent of feature count p.
+    """
     return {
         "iterations":          {"low": 100,   "high": 5000},
         "learning_rate":       {"low": 0.001, "high": 0.3,   "log": True},
-        "depth":               {"low": 2,     "high": min(10, int(np.log2(max(n / 5, 4))))},
+        "depth":               {"low": 2,     "high": max(3, min(10, int(np.log2(max(n / 5, 4)))))},
         "l2_leaf_reg":         {"low": 0.01,  "high": 100.0, "log": True},
         "min_data_in_leaf":    {"low": 1,     "high": max(2, min(200, n // 50))},
         "random_strength":     {"low": 0.001, "high": 10.0,  "log": True},
         "bagging_temperature": {"low": 0.1,   "high": 1.0},
         "border_count":        {"low": 32,    "high": 255},
         "colsample_bylevel":   {"low": 0.05,  "high": 1.0},
-        "one_hot_max_size":    {"low": 2,     "high": min(25, max(p, 2))},
+        "one_hot_max_size":    {"low": 2,     "high": 25},
     }
 
 
@@ -336,11 +341,39 @@ def fill_config_defaults(
 # =============================================================================
 
 def compute_permutation_test(y_true, y_pred, metric_fns, metric_names, n_perm, seed, run_dir):
-    """
-    Permutation test for OOF model performance.
-    Shuffles y_true relative to fixed y_pred to build null distributions.
-    All scoring functions follow the convention: higher = better.
-    P-value = (# permuted >= observed + 1) / (n_perm + 1).
+    """Run a one-sided permutation test (model vs. chance) for each metric.
+
+    Shuffles y_true relative to fixed y_pred to build null distributions. A while-loop
+    guarantees exactly n_perm successful iterations (capped at 2 * n_perm total attempts).
+    Permutation failures are rare numerical artifacts, not diagnostic events — retry is
+    statistically valid because permutations preserve the full y distribution (no class-loss
+    issue). This contrasts with bootstrap drops, which are diagnostic of class imbalance.
+
+    P-value uses the Davison & Hinkley (1997) +1 correction:
+    p = (sum(null >= observed) + 1) / (n_perm_effective + 1).
+
+    Parameters
+    ----------
+    y_true : array-like
+        Observed outcome values.
+    y_pred : array-like
+        Model predictions (fixed across all permutations).
+    metric_fns : list[callable]
+        Scoring functions (higher = better convention).
+    metric_names : list[str]
+        Corresponding metric names; `neg_` prefix triggers sign-aware display.
+    n_perm : int
+        Target number of successful permutation iterations.
+    seed : int
+        Random seed for the permutation RNG.
+    run_dir : str
+        Directory to save `permutation_test_results.csv` and
+        `permutation_null_distributions.parquet`.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: metric, observed, null_mean, null_std, p_value.
     """
     rng = np.random.default_rng(seed)
     n = len(y_true)
@@ -353,16 +386,34 @@ def compute_permutation_test(y_true, y_pred, metric_fns, metric_names, n_perm, s
         except Exception:
             observed[name] = np.nan
 
-    # Null distributions
-    null_dists = {name: np.full(n_perm, np.nan) for name in metric_names}
+    # Null distributions — while-loop guarantees n_perm successful iterations.
+    # Unlike bootstraps (where single-class failure is diagnostic), permutation
+    # failures are rare numerical artifacts with no diagnostic value: retry is
+    # statistically valid because permutations preserve the full y distribution.
+    null_dists = {name: [] for name in metric_names}
+    n_attempts = 0
+    max_attempts = 2 * n_perm
 
-    for i in range(n_perm):
+    while min(len(v) for v in null_dists.values()) < n_perm and n_attempts < max_attempts:
+        n_attempts += 1
         y_perm = y_true[rng.permutation(n)]
         for name, fn in zip(metric_names, metric_fns):
             try:
-                null_dists[name][i] = fn(y_perm, y_pred)
+                val = fn(y_perm, y_pred)
+                if not np.isnan(val):
+                    null_dists[name].append(val)
             except Exception:
                 pass
+
+    n_perm_effective = min(len(v) for v in null_dists.values())
+    if n_attempts >= max_attempts and n_perm_effective < n_perm:
+        print(
+            f"[WARNING] compute_permutation_test: reached {max_attempts} attempt cap. "
+            f"Effective permutation count: {n_perm_effective}/{n_perm}."
+        )
+
+    # Convert lists to arrays, truncated to minimum effective count for alignment
+    null_dists = {name: np.array(v[:n_perm_effective]) for name, v in null_dists.items()}
 
     # P-values and summary
     def _to_display(name, val):
@@ -409,9 +460,43 @@ def compute_permutation_test(y_true, y_pred, metric_fns, metric_names, n_perm, s
 
 
 def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
-    """Compute Confidence Interval for a metric via bootstrapping (raw scale)."""
+    """Compute a bootstrapped confidence interval for a metric (raw scale).
+
+    Bootstrap iterations where all resampled y_true values share a single class are
+    dropped (the metric is undefined for single-class samples). This can occur with
+    severely imbalanced classification on small n. n_boot_effective tracks the number
+    of valid iterations and is reported as a confidence proxy when the drop rate
+    exceeds 5%.
+
+    Note: dropped iterations are NOT replaced. The failure rate is diagnostic of
+    sample size vs. class imbalance and should not be suppressed via retry. This
+    contrasts with compute_permutation_test(), where retry is statistically valid.
+
+    Parameters
+    ----------
+    y_true : array-like
+        True outcome values.
+    y_pred : array-like
+        Model predictions.
+    metric_fn : callable
+        Scoring function (y_true, y_pred) -> float (higher = better).
+    n_boot : int
+        Number of bootstrap iterations.
+    alpha : float
+        Significance level; CI = [alpha/2, 1-alpha/2] percentiles.
+
+    Returns
+    -------
+    base_score : float
+        Score on the full (non-resampled) data.
+    lower : float
+        Lower CI bound (alpha/2 percentile).
+    upper : float
+        Upper CI bound (1 - alpha/2 percentile).
+    """
     scores = []
     indices = np.arange(len(y_true))
+    n_dropped = 0
 
     # Baseline
     try:
@@ -422,12 +507,22 @@ def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
     for _ in range(n_boot):
         idx = resample(indices, replace=True, n_samples=len(indices))
         if len(np.unique(y_true[idx])) < 2:
+            n_dropped += 1
             continue
         try:
             score = metric_fn(y_true[idx], y_pred[idx])
             scores.append(score)
         except Exception:
             continue
+
+    n_boot_effective = len(scores)
+    drop_rate = n_dropped / n_boot if n_boot > 0 else 0.0
+    if drop_rate > 0.05:
+        print(
+            f"[WARNING] compute_bootstrap_ci: {drop_rate:.1%} of bootstrap iterations "
+            f"dropped (single-class resample). n_boot_effective={n_boot_effective}/{n_boot}. "
+            f"CIs may be unreliable for severely imbalanced data."
+        )
 
     if not scores:
         return base_score, base_score, base_score

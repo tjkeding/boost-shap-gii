@@ -50,6 +50,7 @@ suppressPackageStartupMessages({
   library(grid)
   library(grDevices)
   library(yaml)
+  library(parallel)
 })
 
 # Path to the YAML config used for this run
@@ -61,8 +62,13 @@ if (length(args) >= 5) {
   RUN_DIR <- args[5]
 }
 
-# Read available cores for parallel processing
-N_CORES <- cfg$execution$n_jobs
+# Read available cores for parallel processing; cap at physical core count.
+# detectCores(logical = FALSE) returns NA on some systems — fall back to config value.
+N_CORES <- local({
+  detected <- parallel::detectCores(logical = FALSE)
+  requested <- cfg$execution$n_jobs
+  if (is.na(detected)) requested else min(requested, detected)
+})
 
 # Read spline parameters from YAML config
 SPLINE_K_KNOTS <- cfg$shap$splines$n_knots
@@ -246,12 +252,12 @@ if (!perf_plotted_flag) {
 
 get_global_x_limit_dir <- function(shap_dir) {
   global_max <- 0
-  p1 <- file.path(shap_dir, "bootstrap_distributions_GII.parquet")
+  p1 <- file.path(shap_dir, "bootstrap_distributions_M.parquet")
   if (file.exists(p1)) {
     m <- max(as.matrix(read_parquet(p1)), na.rm = TRUE)
     if (m > global_max) global_max <- m
   }
-  p2 <- file.path(shap_dir, "stratified_noise_distributions_GII.parquet")
+  p2 <- file.path(shap_dir, "stratified_noise_distributions_M.parquet")
   if (file.exists(p2)) {
     m <- max(as.matrix(read_parquet(p2)), na.rm = TRUE)
     if (m > global_max) global_max <- m
@@ -271,8 +277,8 @@ df_sig <- df_stats %>%
 cat(sprintf("[INFO] Found %d significant features to plot.\n", nrow(df_sig)))
 
 micro_path <- file.path(SHAP_DIR, "microdata_GII.parquet")
-boot_path <- file.path(SHAP_DIR, "bootstrap_distributions_GII.parquet")
-noise_path <- file.path(SHAP_DIR, "stratified_noise_distributions_GII.parquet")
+boot_path <- file.path(SHAP_DIR, "bootstrap_distributions_M.parquet")
+noise_path <- file.path(SHAP_DIR, "stratified_noise_distributions_M.parquet")
 
 if (!file.exists(micro_path) || !file.exists(boot_path) || !file.exists(noise_path)) {
   cat(sprintf("[WARNING] Missing parquet files in %s, skipping.\n", shap_label))
@@ -339,7 +345,7 @@ results <- foreach(i = 1:nrow(df_sig), .packages = c("ggplot2", "dplyr", "spline
       plot.background = element_rect(fill = "transparent", color = NA),
       plot.margin = unit(c(1, 0.5, 1, 1), "mm")
     ) +
-    labs(x = "GII Magnitude", y = "Density")
+    labs(x = "Importance Magnitude (M)", y = "Density")
 
   # --- PANEL 2: V-COMPONENT ---
   df_m <- df_micro %>% filter(effect_name == feat_name)

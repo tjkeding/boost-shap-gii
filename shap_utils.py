@@ -12,17 +12,30 @@ SHAP Analysis Library for boost-shap-gii
 Statistical Assumptions
 -----------------------
 1. Bootstrap: Observations are approximately exchangeable within the
-   SHAP matrix (not time-series dependent). Default B≥2000 provides
+   SHAP matrix (not time-series dependent). Default B>=2000 provides
    stable percentile CIs at alpha=0.05.
-2. Permutation test: Null hypothesis is that a real effect's bootstrap
-   distribution equals the max-shadow distribution for its stratum.
+2. Boruta Exceedance: Null hypothesis for each effect is that its bootstrap
+   distribution does not exceed the stratum max-shadow distribution.
    One-sided test: higher = more important.
+   Exceedance p-values use the Davison & Hinkley (1997) +1 correction:
+   p = (sum(boot <= noise) + 1) / (n_boot + 1). Minimum achievable p = 1/(n_boot+1).
 3. Splines (V component): SHAP-vs-feature relationship is smooth enough
    for configured n_knots/degree. Energy conservation gates reject
    overfitting. Auto-downgrade handles sparse unique values.
 4. GII = sqrt(M * V): Geometric mean requires both magnitude AND
-   structured variability. High M + flat V (no trend) → low GII.
-   High V + tiny M (weak effect) → low GII.
+   structured variability. High M + flat V (no trend) -> low GII.
+   High V + tiny M (weak effect) -> low GII.
+5. Interaction Scale: Singletons use the diagonal Phi[i,i] (full scale).
+   Interactions use Phi[i,j] + Phi[j,i] (both off-diagonal cells). CatBoost
+   divides the total interaction contribution by 2 per cell, so the summed
+   convention recovers the true Shapley interaction index. This ensures
+   singleton and interaction GII are on the same prediction-contribution scale.
+6. Boruta Noise Baseline: Shadow SHAP values are conditioned on real features
+   (shadow model trained jointly on 2p features). The noise baseline is therefore
+   model-adaptive. This is standard Boruta behavior (Kursa & Rudnicki, 2010).
+7. NaN handling: V spline failures return NaN (not 0.0). Downstream aggregation
+   (nanmean, nanpercentile) excludes failed iterations natively. The v_failure_rate
+   diagnostic warns when > 5% of iterations fail for a given effect.
 """
 
 from __future__ import annotations
@@ -238,14 +251,31 @@ def calculate_v_spline_1d(x: np.ndarray, y: np.ndarray, n_knots: int, degree: in
     except Exception:
         return np.nan  # NaN distinguishes "spline failure" from "genuinely zero V"
 
-def calculate_v_spline_2d(x1: np.ndarray, x2: np.ndarray, y: np.ndarray, n_knots: int, degree: int) -> float:
-    """V = StdDev of 2D Bivariate Spline (with Variance Inflation Check)."""
+def calculate_v_spline_2d(x1: np.ndarray, x2: np.ndarray, y: np.ndarray, n_knots: int, degree: int,
+                          discrete_threshold: int = 15) -> float:
+    """V = StdDev of 2D Bivariate Spline (with Variance Inflation Check).
+
+    When one axis lacks sufficient knot resolution, routes to stacked-spline
+    (treating the low-resolution axis as a discrete grouping variable). Falls back
+    to group-means only when BOTH axes lack resolution (quasi-discrete x quasi-discrete).
+    """
     try:
         tx, kx_adj = _get_adaptive_knots_and_degree(x1, n_knots, degree)
         ty, ky_adj = _get_adaptive_knots_and_degree(x2, n_knots, degree)
 
-        if len(tx) < 2 or len(ty) < 2:
-            return 0.0
+        x1_ok = len(tx) >= 2
+        x2_ok = len(ty) >= 2
+
+        if not x1_ok and not x2_ok:
+            # Both axes lack resolution: use 2D group means (appropriate for
+            # quasi-discrete x quasi-discrete interactions)
+            return calculate_v_group_means_2d(x1, x2, y)
+        elif not x1_ok:
+            # x1 lacks resolution: treat x1 as discrete grouping, fit 1D splines along x2
+            return calculate_v_stacked_spline(x2, x1, y, n_knots, degree, discrete_threshold)
+        elif not x2_ok:
+            # x2 lacks resolution: treat x2 as discrete grouping, fit 1D splines along x1
+            return calculate_v_stacked_spline(x1, x2, y, n_knots, degree, discrete_threshold)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -345,12 +375,32 @@ def _flatten_interaction_matrix(
     feature_names: List[str],
     effect_filter: str = "real"
 ) -> Tuple[pd.DataFrame, Dict[str, Tuple[Tuple[int, int], str]]]:
-    """
-    Flattens SHAP interaction matrix into a DataFrame of effects.
+    """Flatten the SHAP interaction matrix into a per-effect DataFrame.
 
-    effect_filter controls which effects are extracted:
-      "real"         — singletons/interactions where ALL features are real (no shadow_)
-      "shadow_pure"  — singletons where feature IS shadow; interactions where BOTH are shadow
+    Scale convention:
+    - Singletons: Phi[i,i] (diagonal) — stored at full scale.
+    - Interactions: Phi[i,j] + Phi[j,i] (both off-diagonal cells). CatBoost's
+      ShapInteractionValues divides the total interaction contribution equally across
+      both off-diagonal cells, so the sum recovers the true Shapley interaction index.
+      This ensures singletons and interactions are on the same prediction-contribution
+      scale, making cross-type GII comparisons valid.
+
+    Parameters
+    ----------
+    phi_inter : np.ndarray, shape (N, M, M)
+        SHAP interaction matrix for N observations and M features.
+    feature_names : list[str]
+        Feature names corresponding to the M columns of phi_inter.
+    effect_filter : str
+        "real"        — singletons/interactions where ALL features are real (no shadow_)
+        "shadow_pure" — singletons where feature IS shadow; interactions where BOTH are shadow
+
+    Returns
+    -------
+    df_flat : pd.DataFrame
+        Columns are effect names; rows are observations.
+    metadata : dict
+        Maps effect name to ((i, j), type_str) where type_str is "Singleton" or "Interaction".
     """
     N, M, _ = phi_inter.shape
     data = {}
@@ -497,7 +547,7 @@ def _bootstrap_worker_chunk(
                 if nature_a == "discrete" and nature_b == "discrete":
                     v[e] = calculate_v_group_means_2d(vec_a, vec_b, shap_v)
                 elif nature_a == "continuous" and nature_b == "continuous":
-                    v[e] = calculate_v_spline_2d(vec_a, vec_b, shap_v, n_knots, degree)
+                    v[e] = calculate_v_spline_2d(vec_a, vec_b, shap_v, n_knots, degree, discrete_threshold)
                 else:
                     if nature_a == "continuous":
                         v[e] = calculate_v_stacked_spline(vec_a, vec_b, shap_v, n_knots, degree, discrete_threshold)
@@ -566,7 +616,7 @@ def _process_and_save_microdata(
 
         # Build block
         block = pd.DataFrame({
-            "id": id_vals, # NEW: ID
+            "id": id_vals,
             "effect_name": eff,
             "shap_value": phi
         })
@@ -696,19 +746,17 @@ def _run_bootstrap_pipeline(
     boot_var = np.concatenate([r[1] for r in res_real], axis=0)
     boot_gii = np.concatenate([r[2] for r in res_real], axis=0)
 
-    # Track V spline failure rate per effect (NaN = spline exception).
-    # Compute BEFORE replacing NaN with 0.0.
+    # Track V spline failure rate before downstream aggregation.
     v_failure_rate = np.isnan(boot_var).mean(axis=0)
     for e_idx, e_name in enumerate(effect_names):
         if v_failure_rate[e_idx] > 0.05:
             print(f"[WARNING] Effect '{e_name}': V spline failed in "
                   f"{v_failure_rate[e_idx]*100:.1f}% of bootstrap iterations")
 
-    # Replace NaN in boot_var/boot_gii with 0.0 so downstream nanmean/nanpercentile
-    # treat failed iterations conservatively (V=0 → GII=0 for that iteration).
-    nan_in_var = np.isnan(boot_var)
-    boot_var[nan_in_var] = 0.0
-    boot_gii[nan_in_var] = 0.0
+    # NaN values in boot_var/boot_gii (from spline failures) are intentionally
+    # preserved. Downstream aggregation (nanmean, nanpercentile) excludes them
+    # natively. Replacing with 0.0 would conflate computational failure with
+    # genuinely zero V, biasing GII estimates downward and inflating p-values.
 
     # 2. Bootstrap Execution (Shadow/Noise) & Stratified Max Boruta
     stratified_noise_m = np.zeros((n_boot, n_features))
@@ -825,9 +873,12 @@ def _run_bootstrap_pipeline(
     stab_gii = _safe_stability(np.nanmedian(boot_gii, axis=0), ci_w_gii)
 
     # Stratified Max Exceedance P-Values (Real <= Stratum Max Shadow)
-    p_exceed_m = np.nanmean(boot_mag <= stratified_noise_m, axis=0)
-    p_exceed_v = np.nanmean(boot_var <= stratified_noise_v, axis=0)
-    p_exceed_gii = np.nanmean(boot_gii <= stratified_noise_gii, axis=0)
+    # +1 correction (Davison & Hinkley 1997; Phipson & Smyth 2010): prevents
+    # p=0 and is consistent with compute_permutation_test() in utils.py.
+    # Minimum achievable p = 1 / (n_boot + 1).
+    p_exceed_m = (np.nansum(boot_mag <= stratified_noise_m, axis=0) + 1) / (n_boot + 1)
+    p_exceed_v = (np.nansum(boot_var <= stratified_noise_v, axis=0) + 1) / (n_boot + 1)
+    p_exceed_gii = (np.nansum(boot_gii <= stratified_noise_gii, axis=0) + 1) / (n_boot + 1)
 
     # FDR Correction — NaN-safe: multipletests() returns all-NaN q-values if ANY
     # input p-value is NaN. Mask NaN→1.0 (conservative: "not significant"), run
@@ -1078,6 +1129,32 @@ def _run_shap_for_slice(
 
 
 def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
+    """Execute the full SHAP GII pipeline for all output slices.
+
+    Entry point called by predict.py (OOF mode) and infer.py (inference mode).
+    For single-output models, one SHAP directory is created (`shap_analysis/`).
+    For multiclass or multi-regression models, one directory per class/target
+    (`shap_<label>/`).
+
+    Parameters
+    ----------
+    ctx : dict
+        Pipeline context dictionary with keys:
+        - run_dir (str): output directory for SHAP artifacts.
+        - config (dict): full pipeline config.
+        - task (str): task type string.
+        - feature_names (list[str]): real feature names (no shadow_ prefix).
+        - feature_names_shadow (list[str]): real + shadow feature names.
+        - cat_features (list[str]): nominal feature names.
+        - feature_types (dict): {name: type} map.
+        - X (pd.DataFrame): encoded feature matrix.
+        - y (pd.Series or pd.DataFrame or None): outcome values.
+        - X_raw (pd.DataFrame): pre-encoding feature matrix for microdata.
+        - ids (pd.Series): row identifiers.
+        - class_labels (list or None): for multiclass tasks.
+        - target_labels (list or None): for multi_regression tasks.
+        - inference_mode (bool, optional): if True, use full-dataset splits per fold.
+    """
     run_dir = ctx["run_dir"]
     config = ctx["config"]
     task = ctx["task"]
