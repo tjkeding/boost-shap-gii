@@ -6,7 +6,7 @@ import subprocess
 import importlib
 
 PYTHON_DEPS = [
-    "catboost", "optuna", "shap", "pyarrow", "sklearn", "scipy",
+    "catboost", "optuna", "pyarrow", "sklearn", "scipy",
     "pandas", "yaml", "joblib", "statsmodels"
 ]
 
@@ -62,12 +62,17 @@ def check_r():
     print("   - All R dependencies found.")
     return True
 
-if __name__ == "__main__":
+def main():
+    """Run all environment checks and exit non-zero on failure."""
     py_ok = check_python()
     r_ok = check_r()
-    
+
     if not (py_ok and r_ok):
         sys.exit(1)
-    
+
     print("[SUCCESS] Environment verification complete.")
     sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import warnings
 from typing import Dict, List, Any, Tuple
 
@@ -24,7 +23,7 @@ from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 import optuna
 from optuna.samplers import TPESampler
 
-from utils import (
+from .utils import (
     _normalize_quotes,
     load_config,
     save_json_atomic,
@@ -484,7 +483,10 @@ def main():
 
         # Create ordered categorical then code
         cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
-        X[c] = X[c].astype(cat_type).cat.codes.astype("Int64")
+        # Explicitly set out-of-category values to NaN before casting to avoid
+        # deprecated silent coercion (pandas 2.0+ FutureWarning)
+        _src = X[c].where(X[c].isin(levels) | X[c].isna(), other=pd.NA)
+        X[c] = _src.astype(cat_type).cat.codes.astype("Int64")
         # Note: missing values become -1 in codes, we mask them back to NaN/Int64 NA
         X.loc[X[c] == -1, c] = pd.NA
 

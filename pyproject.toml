@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boost-shap-gii"
+version = "1.0.0"
+description = "Config-driven gradient boosting with SHAP-based global importance indices (GII)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    {name = "TJ Keding"},
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyyaml",
+    "scikit-learn",
+    "scipy",
+    "statsmodels",
+    "joblib",
+    "pyarrow",
+    "catboost",
+    "optuna",
+]
+
+[project.scripts]
+boost-shap-gii = "boost_shap_gii.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+boost_shap_gii = ["scripts/*.R", "scripts/*.sh"]

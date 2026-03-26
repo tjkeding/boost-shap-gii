@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import glob
 import warnings
 from datetime import datetime
@@ -18,7 +17,7 @@ import yaml
 
 from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 
-from utils import (
+from .utils import (
     _normalize_quotes,
     load_config,
     save_json_atomic,
@@ -30,11 +29,7 @@ from utils import (
     compute_permutation_test,
 )
 
-try:
-    from shap_utils import run_shap_pipeline
-except ImportError:
-    sys.path.append(os.path.dirname(__file__))
-    from shap_utils import run_shap_pipeline
+from .shap_utils import run_shap_pipeline
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -191,7 +186,10 @@ def main():
                 )
 
         cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
-        X[c] = df_raw[c].astype(cat_type).cat.codes.astype("Int64")
+        # Explicitly set out-of-category values to NaN before casting to avoid
+        # deprecated silent coercion (pandas 2.0+ FutureWarning)
+        _src = df_raw[c].where(df_raw[c].isin(levels) | df_raw[c].isna(), other=pd.NA)
+        X[c] = _src.astype(cat_type).cat.codes.astype("Int64")
         X.loc[X[c] == -1, c] = pd.NA
 
     # Reorder exactly as trained

@@ -6,24 +6,75 @@ A YAML-driven predictive modeling pipeline combining CatBoost and SHAP interacti
 
 ---
 
-## Quickstart
+## Installation
 
-### 1. Environment Setup
+### From GitHub
+```bash
+pip install git+https://github.com/tjkeding/boost-shap-gii
+```
+
+### Development Install
+```bash
+git clone https://github.com/tjkeding/boost-shap-gii.git
+cd boost-shap-gii
+pip install -e .
+```
+
+### Conda Environment (Alternative)
+A conda environment specification is provided for users who prefer isolated environment management:
 ```bash
 conda env create -f environment.yaml
 conda activate boost-shap-gii
+pip install -e .
 ```
-*Note: Install R packages separately as listed in environment.yaml.*
 
-### 2. Configuration
+**R (optional):** R is required only for the `plot` subcommand. Install R packages separately as listed in `environment.yaml`.
+
+---
+
+## Quickstart
+
+### 1. Configuration
 Copy `example_config_minimal.yaml` and specify your:
 - `paths.input_data` (CSV/Parquet)
 - `paths.output_dir`
 - `features` (column patterns for continuous/ordinal/nominal)
 - `modeling.outcome`
 
-### 3. Running the Pipeline
-The orchestrator automatically verifies your environment and data paths before starting.
+### 2. Running the Pipeline
+
+#### CLI Interface
+
+The `boost-shap-gii` command provides independently callable subcommands for each pipeline stage.
+
+**Verify dependencies:**
+```bash
+boost-shap-gii check-env
+```
+
+**Training and hyperparameter tuning:**
+```bash
+boost-shap-gii train --config config.yaml
+```
+
+**Out-of-fold evaluation and SHAP analysis:**
+```bash
+boost-shap-gii predict --config config.yaml
+```
+
+**Inference on an independent dataset:**
+```bash
+boost-shap-gii infer --config resolved_config.yaml --data new_data.csv --output-subdir subdir_name
+```
+
+**Visualization of significant effects (requires R):**
+```bash
+boost-shap-gii plot --config config.yaml --outcome-range RANGE --negate-shap true --y-axis-label "Label"
+```
+
+#### Alternative: Shell Script
+
+The shell script orchestrator is available as an alternative interface. It automatically chains training, prediction, and plotting into a single command.
 
 **Training & SHAP Analysis:**
 ```bash

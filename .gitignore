@@ -1,18 +1,34 @@
 # Ignore everything by default
 *
 
-# Core pipeline files
+# Project configuration and documentation
 !.gitignore
+!pyproject.toml
+!LICENSE
 !environment.yaml
 !example_config_advanced.yaml
 !example_config_minimal.yaml
-!infer.py
-!plot.R
-!predict.py
-!run_boost-shap-gii.sh
-!shap_utils.py
-!train.py
-!utils.py
 !README.md
 !INPUT_SPECIFICATION.md
-!check_env.py
+
+# Source package (recursive whitelist)
+!src/
+!src/boost_shap_gii/
+!src/boost_shap_gii/__init__.py
+!src/boost_shap_gii/cli.py
+!src/boost_shap_gii/train.py
+!src/boost_shap_gii/predict.py
+!src/boost_shap_gii/infer.py
+!src/boost_shap_gii/shap_utils.py
+!src/boost_shap_gii/utils.py
+!src/boost_shap_gii/check_env.py
+!src/boost_shap_gii/scripts/
+!src/boost_shap_gii/scripts/plot.R
+!src/boost_shap_gii/scripts/run_boost-shap-gii.sh
+
+# AI development transparency artifacts
+!AID_LOG.md
+!.aid/
+!.aid/reports/
+!.aid/reports/*.md
+!.aid/project_claude.md

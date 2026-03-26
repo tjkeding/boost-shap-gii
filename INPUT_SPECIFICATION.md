@@ -4,14 +4,64 @@
 
 ---
 
+### 0. Package Structure and Invocation
+
+#### Source Layout
+The pipeline is organized as an installable Python package under the `src/` layout:
+```
+src/boost_shap_gii/
+    __init__.py          # Package metadata (version)
+    cli.py               # CLI entry point with subcommand dispatch
+    train.py             # Data ingestion, feature selection, model training
+    predict.py           # OOF evaluation and SHAP analysis
+    infer.py             # Independent dataset inference
+    shap_utils.py        # GII computation and noise calibration
+    utils.py             # Shared utility functions
+    check_env.py         # Dependency verification
+    scripts/
+        plot.R           # ggplot2-based visualization
+        run_boost-shap-gii.sh  # Shell script orchestrator
+```
+
+#### Installation
+```bash
+pip install git+https://github.com/tjkeding/boost-shap-gii   # from GitHub
+pip install -e .                                               # editable (development)
+```
+
+#### CLI Entry Points
+After installation, the `boost-shap-gii` command is available on `PATH`:
+```
+boost-shap-gii check-env
+boost-shap-gii train    --config CONFIG
+boost-shap-gii predict  --config CONFIG
+boost-shap-gii infer    --config CONFIG --data DATA --output-subdir SUBDIR
+boost-shap-gii plot     --config CONFIG --outcome-range RANGE --negate-shap BOOL --y-axis-label LABEL [--run-dir DIR]
+```
+
+#### Module Invocation (Alternative)
+Each pipeline stage can also be invoked as a Python module:
+```bash
+python -m boost_shap_gii.check_env
+python -m boost_shap_gii.train    --config CONFIG
+python -m boost_shap_gii.predict  --config CONFIG
+python -m boost_shap_gii.infer    --config CONFIG --data DATA --output-subdir SUBDIR
+```
+The shell script `run_boost-shap-gii.sh` uses module invocation internally and remains available
+as a pipeline orchestrator that chains training, prediction, and plotting.
+
+---
+
 ### 1. Pipeline Stages
 
 #### Stage 0: Pre-flight (`check_env.py`)
+- **Invocation**: `boost-shap-gii check-env` or `python -m boost_shap_gii.check_env`.
 - **Python Verification**: Imports `catboost`, `optuna`, `shap`, `pyarrow`, `sklearn`, `scipy`,
   `pandas`, `yaml`, `joblib`, `statsmodels`.
 - **R Verification**: Checks `ggplot2`, `dplyr`, `arrow`, `tidyr`, `foreach`, `doParallel`,
-  `gridExtra`, `stringr`, `yaml`.
-- **Guard Logic**: Aborts `run_boost-shap-gii.sh` if any dependency is missing.
+  `gridExtra`, `stringr`, `yaml`. R is optional; missing R packages produce a warning but
+  do not abort the pipeline (only the `plot` subcommand requires R).
+- **Guard Logic**: Aborts if any Python dependency is missing.
 
 #### Stage 1: Data Ingestion
 - **Formats**: `.csv` or `.parquet`.
@@ -270,6 +320,30 @@ method-switching.
 
 ### 5. Directory Structure & Artifacts
 
+#### Source Package Layout
+```
+boost-shap-gii/
+├── pyproject.toml                # Package metadata, dependencies, CLI entry point
+├── environment.yaml              # Conda environment specification
+├── example_config_advanced.yaml  # Full config template with all parameters
+├── example_config_minimal.yaml   # Minimal config template (defaults auto-filled)
+├── README.md                     # User-facing documentation
+├── INPUT_SPECIFICATION.md        # Technical reference (this file)
+└── src/boost_shap_gii/
+    ├── __init__.py               # Package version
+    ├── cli.py                    # CLI entry point (boost-shap-gii command)
+    ├── train.py                  # Data ingestion, feature selection, model training
+    ├── predict.py                # OOF evaluation and SHAP analysis
+    ├── infer.py                  # Independent dataset inference
+    ├── shap_utils.py             # GII computation and noise calibration
+    ├── utils.py                  # Shared utility functions
+    ├── check_env.py              # Dependency verification
+    └── scripts/
+        ├── plot.R                # ggplot2-based visualization
+        └── run_boost-shap-gii.sh # Shell script orchestrator (alternative interface)
+```
+
+#### Pipeline Output Layout
 ```
 output_dir/
 ├── resolved_config.yaml          # Fully-expanded config with all defaults applied

@@ -58,7 +58,7 @@ from scipy import stats
 from statsmodels.stats.multitest import multipletests
 from joblib import Parallel, delayed
 
-from utils import get_cv_splitter, detect_task, is_regression
+from .utils import get_cv_splitter, detect_task, is_regression
 
 # -----------------------------------------------------------------------------
 # 1. IO & Helpers
@@ -92,7 +92,14 @@ def _to_numeric_matrix(df: pd.DataFrame) -> np.ndarray:
     """
     df_num = df.copy()
     for col in df_num.columns:
-        if df_num[col].dtype.name == 'category' or df_num[col].dtype == object:
+        if df_num[col].dtype.name == 'category':
+            # Already categorical; extract codes directly (no redundant re-cast)
+            codes = df_num[col].cat.codes
+            max_code = codes.max()
+            # NaN (-1 in cat.codes) -> max_code + 1 as distinct sentinel level
+            codes = codes.where(codes != -1, max_code + 1)
+            df_num[col] = codes
+        elif df_num[col].dtype == object:
             codes = df_num[col].astype('category').cat.codes
             max_code = codes.max()
             # NaN (-1 in cat.codes) -> max_code + 1 as distinct sentinel level

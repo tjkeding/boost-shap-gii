@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
-cd "$(dirname "$0")"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 mode=${1:-"train"}
 
 # 1. PRE-FLIGHT ENVIRONMENT CHECK
-if ! python3 check_env.py; then
+if ! python3 -m boost_shap_gii.check_env; then
     echo "[ABORT] Environment check failed. Fix missing dependencies above."
     exit 1
 fi
@@ -42,13 +43,13 @@ if [ "$mode" == "train" ]; then
     fi
 
     # Tune and train a boosting model using tabular data with mixed data types
-    python3 train.py --config "${config_file}" 2>&1 | tee train_output.log
+    python3 -m boost_shap_gii.train --config "${config_file}" 2>&1 | tee train_output.log
 
     # Evaluate boosting models against chance and generate global importance indices (GII; importance for each feature) from SHAP
-    python3 predict.py --config "${config_file}" 2>&1 | tee predict_shap_output.log
+    python3 -m boost_shap_gii.predict --config "${config_file}" 2>&1 | tee predict_shap_output.log
 
     # Plot features with statistically significant GII scores
-    Rscript plot.R "${config_file}" "${plot_outcome_theo_max}" "${plot_negate_shap}" "${plot_y_axis_lab}" 2>&1 | tee plot_output.log
+    Rscript "${SCRIPT_DIR}/plot.R" "${config_file}" "${plot_outcome_theo_max}" "${plot_negate_shap}" "${plot_y_axis_lab}" 2>&1 | tee plot_output.log
 
 elif [ "$mode" == "infer" ]; then
     if [ $# -ne 7 ]; then
@@ -80,12 +81,12 @@ elif [ "$mode" == "infer" ]; then
     fi
 
     # Apply trained models to independent dataset
-    python3 infer.py --config "${config_file}" --data "${data_path}" \
+    python3 -m boost_shap_gii.infer --config "${config_file}" --data "${data_path}" \
         --output-subdir "${output_subdir}" 2>&1 | tee infer_output.log
 
     # Plot inference SHAP results (pass inference dir as 5th arg to override RUN_DIR)
     infer_dir=$(python3 -c "import yaml; c=yaml.safe_load(open('${config_file}')); print(c['paths']['output_dir'] + '/${output_subdir}')")
-    Rscript plot.R "${config_file}" "${plot_outcome_theo_max}" "${plot_negate_shap}" "${plot_y_axis_lab}" "${infer_dir}" 2>&1 | tee plot_output.log
+    Rscript "${SCRIPT_DIR}/plot.R" "${config_file}" "${plot_outcome_theo_max}" "${plot_negate_shap}" "${plot_y_axis_lab}" "${infer_dir}" 2>&1 | tee plot_output.log
 
 else
     echo "Usage: $0 {train|infer} [args...]"
