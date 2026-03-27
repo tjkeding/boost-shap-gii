@@ -3,7 +3,7 @@
 # -----------------------------------------------------------------------------
 # SHAP Visualization Engine (GII Density + V-Component Splines)
 # -----------------------------------------------------------------------------
-# Dependencies: ggplot2, dplyr, arrow, tidyr, foreach, doParallel, gridExtra, splines
+# Dependencies: ggplot2, dplyr, nanoparquet, tidyr, foreach, doParallel, gridExtra, splines
 # -----------------------------------------------------------------------------
 
 # --- 1. USER CONFIGURATION ---------------------------------------------------
@@ -40,7 +40,7 @@ if (NEGATE_SHAP){
 suppressPackageStartupMessages({
   library(ggplot2)
   library(dplyr)
-  library(arrow)
+  library(nanoparquet)
   library(tidyr)
   library(foreach)
   library(doParallel)

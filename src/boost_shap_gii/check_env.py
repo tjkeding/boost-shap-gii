@@ -11,7 +11,7 @@ PYTHON_DEPS = [
 ]
 
 R_DEPS = [
-    "ggplot2", "dplyr", "arrow", "tidyr", "foreach", "doParallel", 
+    "ggplot2", "dplyr", "nanoparquet", "tidyr", "foreach", "doParallel",
     "gridExtra", "stringr", "yaml"
 ]
 

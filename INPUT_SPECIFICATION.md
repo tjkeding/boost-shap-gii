@@ -58,7 +58,7 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
 - **Invocation**: `boost-shap-gii check-env` or `python -m boost_shap_gii.check_env`.
 - **Python Verification**: Imports `catboost`, `optuna`, `shap`, `pyarrow`, `sklearn`, `scipy`,
   `pandas`, `yaml`, `joblib`, `statsmodels`.
-- **R Verification**: Checks `ggplot2`, `dplyr`, `arrow`, `tidyr`, `foreach`, `doParallel`,
+- **R Verification**: Checks `ggplot2`, `dplyr`, `nanoparquet`, `tidyr`, `foreach`, `doParallel`,
   `gridExtra`, `stringr`, `yaml`. R is optional; missing R packages produce a warning but
   do not abort the pipeline (only the `plot` subcommand requires R).
 - **Guard Logic**: Aborts if any Python dependency is missing.
