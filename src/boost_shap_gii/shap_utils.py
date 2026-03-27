@@ -99,10 +99,17 @@ def _to_numeric_matrix(df: pd.DataFrame) -> np.ndarray:
             # NaN (-1 in cat.codes) -> max_code + 1 as distinct sentinel level
             codes = codes.where(codes != -1, max_code + 1)
             df_num[col] = codes
-        elif df_num[col].dtype == object:
+        elif pd.api.types.is_string_dtype(df_num[col]):
             codes = df_num[col].astype('category').cat.codes
             max_code = codes.max()
             # NaN (-1 in cat.codes) -> max_code + 1 as distinct sentinel level
+            codes = codes.where(codes != -1, max_code + 1)
+            df_num[col] = codes
+        elif df_num[col].dtype == object:
+            # Fallback for object-dtype columns missed by is_string_dtype
+            # (e.g., mixed types with None in pandas >= 3.0.1)
+            codes = df_num[col].astype('category').cat.codes
+            max_code = codes.max()
             codes = codes.where(codes != -1, max_code + 1)
             df_num[col] = codes
         df_num[col] = df_num[col].astype(float)
@@ -1028,7 +1035,10 @@ def _run_shap_for_slice(
         rng = np.random.default_rng(config["execution"]["random_seed"] + fold_idx + 1000)
         X_val_shadow = X_val_real.copy()
         for c in X_val_shadow.columns:
+            orig_dtype = X_val_shadow[c].dtype
             X_val_shadow[c] = rng.permutation(X_val_shadow[c].values)
+            if orig_dtype.name == 'category':
+                X_val_shadow[c] = X_val_shadow[c].astype(orig_dtype)
         X_val_shadow.columns = [f"shadow_{c}" for c in X_val_shadow.columns]
 
         X_full = pd.concat([X_val_real, X_val_shadow], axis=1)

@@ -698,9 +698,15 @@ def main():
         rng = np.random.default_rng(config["execution"]["random_seed"] + fold_idx)
 
         for c in X_train_shadow.columns:
+            orig_dtype = X_train_shadow[c].dtype
             X_train_shadow[c] = rng.permutation(X_train_shadow[c].values)
+            if orig_dtype.name == 'category':
+                X_train_shadow[c] = X_train_shadow[c].astype(orig_dtype)
         for c in X_val_shadow.columns:
+            orig_dtype = X_val_shadow[c].dtype
             X_val_shadow[c] = rng.permutation(X_val_shadow[c].values)
+            if orig_dtype.name == 'category':
+                X_val_shadow[c] = X_val_shadow[c].astype(orig_dtype)
 
         # Rename columns
         X_train_shadow.columns = [f"shadow_{c}" for c in X_train_shadow.columns]
