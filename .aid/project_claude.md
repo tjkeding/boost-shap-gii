@@ -7,8 +7,9 @@ A pre-existing GitHub repository (https://github.com/tjkeding/boost-shap-gii); a
 - `train.py`: Data input formatting and model training/hyperparameter tuning with cross validation
 - `predict.py`: Model evaluation and call to shap_utils.py for SHAP analysis
 - `infer.py`: Model predictions, evaluation, and call to shap_utils.py for SHAP analysis using a new, independent (non-training) dataset
-- `shap_utils.py`: SHAP-based feature importance: generates magnitude (M) and variability (V) components from SHAP to create the global importance index (GII)
+- `shap_utils.py`: SHAP-based feature importance: generates magnitude (M) and variability (V) components from SHAP to create the global importance index (GII = sqrt(M × V); Cobb-Douglas composite)
 - `utils.py`: Shared utility functions for the pipeline, primarily train.py, predict.py, and infer.py.
+- `indiv_reports.py`: Per-individual SHAP reports with coupled-bootstrap confidence intervals.
 - `plot.R`: Visualization of statistically significant SHAP (GII) effects (NOTE: this is in R, not Python; I prefer ggplot2 for plotting)
 
 ## Key Supplementary Files

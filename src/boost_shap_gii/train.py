@@ -19,6 +19,8 @@ from sklearn.metrics import (
     roc_auc_score, accuracy_score,
 )
 
+from scipy import stats as sp_stats
+
 from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 import optuna
 from optuna.samplers import TPESampler
@@ -193,6 +195,207 @@ def report_missingness(df: pd.DataFrame, features: list, outcome: str, run_dir: 
         high = miss_rates[miss_rates > 0.1]
         for feat in high.index:
             print(f"   - WARNING: '{feat}' is {high[feat]:.1%} missing")
+
+
+def _diagnose_outcome_distribution(y_series: pd.Series, col_name: str) -> None:
+    """Emit advisory warnings for outcome distributions that may degrade RMSE loss.
+
+    Computes zero-inflation rate, skewness, and excess kurtosis on the non-missing
+    outcome values. If any threshold is exceeded, prints a ``[WARNING]`` with the
+    diagnostic values, the recommended MAD-based Huber delta, and a reference to
+    ``INPUT_SPECIFICATION.md``.
+
+    Thresholds and their literature basis:
+    - Zero-inflation >= 15%  (Olsen & Schafer, 2001; Tooze et al., 2002)
+    - |Skewness| >= 2.0      (Kim, 2013)
+    - Excess kurtosis >= 5.0  (Kim, 2013, conservative from 7.0)
+
+    The |skewness| >= 2.0 threshold is anchored to Groeneveld & Meeden (1984)
+    moment-based skewness measures for assessing distributional non-normality.
+    The excess kurtosis >= 5.0 threshold derives from Joanes & Gill (1998)
+    sample-kurtosis bias-correction analysis, adjusted downward to a conservative
+    heuristic for tail-effect amplification under gradient boosting residual accumulation.
+
+    References:
+    - Groeneveld R.A., Meeden G. (1984) Measuring skewness and kurtosis. The Statistician 33: 391-399.
+    - Joanes D.N., Gill C.A. (1998) Comparing measures of sample skewness and kurtosis. The Statistician 47: 183-189.
+
+    The recommended Huber delta uses MAD-based scale estimation (Huber, 1981;
+    Maronna et al., 2006). When MAD = 0 (common with >50% zero-inflation),
+    falls back to IQR / 1.3489, then to SD as a last resort.
+
+    This function is advisory only -- the pipeline continues with whatever loss
+    the user specified. Classification tasks should NOT call this function.
+
+    Parameters
+    ----------
+    y_series : pd.Series
+        Outcome values (may contain NaN; dropped internally).
+    col_name : str
+        Outcome column name for log messages.
+    """
+    y_vals = y_series.dropna().to_numpy(dtype=np.float64)
+    n = len(y_vals)
+    if n < 10:
+        return  # Too few observations for meaningful diagnostics
+
+    # ---- Compute diagnostics ----
+    zero_frac = np.mean(y_vals == 0)
+    skewness = float(sp_stats.skew(y_vals, bias=False))
+    excess_kurt = float(sp_stats.kurtosis(y_vals, fisher=True, bias=False))
+
+    # ---- MAD-based Huber delta (always computed for inclusion in message) ----
+    # When >50% of observations share the median value (common with zero-inflation
+    # >50%), MAD collapses to 0. Fall back to IQR-based scale estimation:
+    #   sigma_hat = IQR / 1.3489, where 1.3489 = 2 * Phi^{-1}(3/4)
+    # is the IQR consistency factor at the normal (Maronna et al., 2006).
+    mad = float(np.median(np.abs(y_vals - np.median(y_vals))))
+    if mad > 0:
+        scale_est = 1.4826 * mad
+        scale_method = "MAD"
+    else:
+        iqr = float(np.percentile(y_vals, 75) - np.percentile(y_vals, 25))
+        scale_est = iqr / 1.3489 if iqr > 0 else float(np.std(y_vals))
+        scale_method = "IQR" if iqr > 0 else "SD"
+    delta = 1.345 * scale_est
+
+    # ---- Check thresholds ----
+    zero_flag = zero_frac >= 0.15
+    skew_flag = abs(skewness) >= 2.0
+    kurt_flag = excess_kurt >= 5.0
+
+    if not (zero_flag or skew_flag or kurt_flag):
+        return  # No distributional concerns
+
+    # ---- Build warning message ----
+    header = (
+        f"[WARNING] Outcome distribution diagnostic for '{col_name}' "
+        f"(n={n}):"
+    )
+    details = []
+    if zero_flag:
+        details.append(
+            f"  Zero-inflation: {zero_frac:.1%} of observations are zero "
+            f"(threshold: 15%)"
+        )
+    if skew_flag:
+        direction = "right" if skewness > 0 else "left"
+        details.append(
+            f"  Skewness: {skewness:.3f} ({direction}-skewed; "
+            f"threshold: |skew| >= 2.0)"
+        )
+    if kurt_flag:
+        details.append(
+            f"  Excess kurtosis: {excess_kurt:.3f} (heavy-tailed; "
+            f"threshold: >= 5.0)"
+        )
+
+    # ---- Delta derivation string (adapts to scale method) ----
+    if scale_method == "MAD":
+        delta_detail = (
+            f"delta = 1.345 * 1.4826 * MAD(y) = {delta:.4f}; "
+            f"MAD = {mad:.4f}"
+        )
+    elif scale_method == "IQR":
+        delta_detail = (
+            f"delta = 1.345 * IQR(y) / 1.3489 = {delta:.4f}; "
+            f"IQR = {iqr:.4f} (MAD = 0; IQR fallback)"
+        )
+    else:  # SD fallback
+        delta_detail = (
+            f"delta = 1.345 * SD(y) = {delta:.4f} "
+            f"(MAD = 0, IQR = 0; SD fallback)"
+        )
+
+    # ---- Context-sensitive recommendation ----
+    if skewness > 0 and zero_flag:
+        recommendation = (
+            "  This combination of right-skew and zero-inflation typically degrades\n"
+            "  RMSE loss by inflating gradients for extreme residuals. Consider using\n"
+            f"  Huber loss: loss_function: \"Huber:delta={delta:.4f}\"\n"
+            f"  ({delta_detail})"
+        )
+    elif skewness < 0 and (zero_flag or skew_flag):
+        recommendation = (
+            "  Left-skewed outcome distribution detected. Huber loss may still reduce\n"
+            "  outlier influence on RMSE gradients, but this pattern is less common\n"
+            "  and warrants manual inspection of the outcome distribution.\n"
+            f"  If using Huber: loss_function: \"Huber:delta={delta:.4f}\"\n"
+            f"  ({delta_detail})"
+        )
+    else:
+        recommendation = (
+            "  Heavy tails or skewness may cause outlier-driven gradient inflation\n"
+            "  under RMSE loss. Consider using Huber loss to cap residual influence.\n"
+            f"  If using Huber: loss_function: \"Huber:delta={delta:.4f}\"\n"
+            f"  ({delta_detail})"
+        )
+
+    recommendation += (
+        "\n  See INPUT_SPECIFICATION.md Section 9 for the full derivation "
+        "and literature."
+    )
+
+    print(header)
+    for d in details:
+        print(d)
+    print(recommendation)
+
+
+def _summarize_series(s: pd.Series) -> dict:
+    """Return descriptive statistics for a numeric Series (unbiased SD, ddof=1)."""
+    return {
+        "mean": float(s.mean()),
+        "sd": float(s.std(ddof=1)),
+        "min": float(s.min()),
+        "max": float(s.max()),
+        "q25": float(s.quantile(0.25)),
+        "q50": float(s.quantile(0.50)),
+        "q75": float(s.quantile(0.75)),
+    }
+
+
+def _write_train_outcome_stats(
+    y: pd.Series | pd.DataFrame,
+    task: str,
+    outcome_cols: list,
+    run_dir: str,
+) -> None:
+    """Write train_outcome_stats.json with training-outcome summary statistics.
+
+    Called unconditionally after the CV fold loop. For regression and
+    multi_regression tasks, the stats dict contains one entry per outcome
+    column (mean, sd, min, max, q25, q50, q75). For classification tasks,
+    stats is an empty dict but the file is still written (providing a stable
+    artifact for downstream consumers regardless of task type).
+
+    Parameters
+    ----------
+    y : pd.Series or pd.DataFrame
+        Raw (unscaled) training-outcome values. For multi_regression this must
+        be the pre-StandardScaler copy captured before target scaling.
+    task : str
+        Task type string (one of VALID_TASK_TYPES).
+    outcome_cols : list[str]
+        Outcome column name(s).
+    run_dir : str
+        Output directory; train_outcome_stats.json is written at its root.
+    """
+    stats: dict = {}
+    if task in {"regression", "multi_regression"}:
+        if task == "regression":
+            series = y if isinstance(y, pd.Series) else y.iloc[:, 0]
+            stats[outcome_cols[0]] = _summarize_series(series)
+        else:  # multi_regression
+            for col in outcome_cols:
+                stats[col] = _summarize_series(y[col])
+    payload = {
+        "task_type": task,
+        "outcome_columns": list(outcome_cols),
+        "n": int(len(y)),
+        "stats": stats,
+    }
+    save_json_atomic(payload, os.path.join(run_dir, "train_outcome_stats.json"))
 
 
 # -----------------------------------------------------------------------------
@@ -441,12 +644,21 @@ def main():
     else:
         y = df_raw[outcome_cols[0]].copy()
 
+    # Outcome Distribution Diagnostics (regression / multi_regression only)
+    task_prelim = detect_task(config)
+    if is_regression(task_prelim):
+        if isinstance(y, pd.DataFrame):
+            for col in y.columns:
+                _diagnose_outcome_distribution(y[col], col)
+        else:
+            _diagnose_outcome_distribution(y, outcome_cols[0])
+
     # A. Force Nominal to String -> Category.
     # NaN is filled with the literal string "__NA__" before encoding. CatBoost treats
     # "__NA__" as a valid category level, allowing the model to learn whether missingness
     # is predictive. This is an implicit informativeness assumption — see README.
     for c in nom_feats:
-        X[c] = X[c].fillna("__NA__").astype(str).astype("category")
+        X[c] = X[c].astype(object).fillna("__NA__").astype(str).astype("category")
 
     # B. Force Continuous to Float
     for c in con_feats:
@@ -516,6 +728,9 @@ def main():
                 f"resample data."
             )
 
+    # Snapshot raw (unscaled) outcome for train_outcome_stats.json before any scaling
+    y_raw = y.copy()
+
     # Auto-scale multi-regression targets to common scale
     target_scaler = None
     if task == "multi_regression":
@@ -547,6 +762,12 @@ def main():
         clean_meta = {}
         for k, v in selector.feature_metadata.items():
             clean_meta[k] = v
+        # Persist nominal-feature observed-level lists for predict/infer-time validation
+        nominal_codebooks = {
+            col: sorted(map(str, df_raw[col].dropna().unique().tolist()))
+            for col in nom_feats
+        }
+        clean_meta["nominal_codebooks"] = nominal_codebooks
         json.dump(clean_meta, f, indent=2)
 
     # 4. Shadow Feature Names (Real + Permuted) for SHAP Utils
@@ -721,16 +942,16 @@ def main():
         shadow_nom_feats = [f"shadow_{c}" for c in nom_feats]
         full_cat_features = nom_feats + shadow_nom_feats
 
-        # 4. Train Shadow Model with early stopping on outer validation fold.
-        # Use tuned_iters * 2 as ceiling — the shadow model trains on 2p features
-        # and requires more iterations to converge. Early stopping on X_val_full
-        # is data-adaptive and introduces no leakage: shadow outputs are never
-        # used for predictive evaluation, only for SHAP noise calibration.
+        # 4. Phase-2 shadow training uses a fixed iteration ceiling of 2 * tuned_iters
+        # with NO early stopping. The 2x ceiling preserves the original rationale that
+        # shadow models need additional iterations to converge with 2p shadow features
+        # added to the feature space (Boruta-style stratified shadow features;
+        # Kursa & Rudnicki 2010). Removing eval_set=pool_val_full closes an
+        # outer-validation-pool leakage path in the shadow-model fit.
         pool_train_full = Pool(X_train_full, y_train, cat_features=full_cat_features)
-        pool_val_full = Pool(X_val_full, y_val, cat_features=full_cat_features)
 
         shadow_params = best_params.copy()
-        shadow_params["iterations"] = tuned_iters * 2  # ceiling, not fixed count
+        shadow_params["iterations"] = tuned_iters * 2  # fixed ceiling, no early stopping
 
         if is_regression(task):
             model_shadow = CatBoostRegressor(**shadow_params)
@@ -739,8 +960,6 @@ def main():
 
         model_shadow.fit(
             pool_train_full,
-            eval_set=pool_val_full,
-            early_stopping_rounds=int(config["modeling"]["tuning"]["early_stopping_rounds"]),
             verbose=False,
         )
 
@@ -779,6 +998,9 @@ def main():
 
     # Save task type for downstream modules
     save_json_atomic({"task_type": task}, os.path.join(run_dir, "task_info.json"))
+
+    # --- Training-outcome statistics artifact (consumed by indiv_reports at predict / infer time) ---
+    _write_train_outcome_stats(y_raw, task, outcome_cols, run_dir)
 
     print(f"[SUCCESS] Training finished. Artifacts in: {run_dir}")
 

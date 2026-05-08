@@ -62,6 +62,27 @@ def check_r():
     print("   - All R dependencies found.")
     return True
 
+def run_preflight() -> None:
+    """Run all environment checks; exit with status 2 on failure.
+
+    Intended to be called from within other CLI command handlers (cmd_train,
+    cmd_predict, cmd_infer, cmd_plot) before any other work, so environment
+    problems surface as a fast early exit with actionable guidance.
+
+    On success: prints "[ENV] Environment preflight passed." and returns.
+    On failure: check_python() / check_r() have already printed the concrete
+    list of missing packages with install commands; this function then calls
+    sys.exit(2). Exit code 2 is distinct from main()'s sys.exit(1) so that CI
+    and log scrapers can distinguish a preflight-gate failure from a standalone
+    check-env invocation failure.
+    """
+    py_ok = check_python()
+    r_ok = check_r()
+    if not (py_ok and r_ok):
+        sys.exit(2)
+    print("[ENV] Environment preflight passed.")
+
+
 def main():
     """Run all environment checks and exit non-zero on failure."""
     py_ok = check_python()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import warnings
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -310,6 +311,7 @@ def fill_config_defaults(
 
     # -- shap --
     _set(["shap", "output_microdata_n"], 10)
+    _set(["shap", "compute_global_on_inference"], False)
 
     # -- shap.bootstrapping --
     n_boot = _default_n_boot(n_rows)
@@ -333,7 +335,239 @@ def fill_config_defaults(
                     f"Search space '{param}': low ({bounds['low']}) >= high ({bounds['high']})"
                 )
 
+    # Validate spline config after defaults are filled
+    validate_spline_config(config)
+
     return config, filled
+
+
+# =============================================================================
+# Indiv-reports and plot config validators
+# =============================================================================
+
+_VALID_INDIV_SCALING_MODES = {"raw", "sd", "custom_value"}
+_REGRESSION_TASKS = {"regression", "multi_regression"}
+
+
+def validate_spline_config(config: dict) -> None:
+    """Validate shap.splines configuration.
+
+    Spline stability requires at least n_knots + degree + 2 unique x values to
+    support the basis (Wood 2017, Generalized Additive Models, ch. 4). Below
+    this threshold, the basis is rank-deficient and fits become unstable.
+    """
+    splines = config.get("shap", {}).get("splines", {})
+    n_knots = splines.get("n_knots")
+    degree = splines.get("degree")
+    discrete_threshold = splines.get("discrete_threshold")
+    if n_knots is None or degree is None or discrete_threshold is None:
+        return  # fill_config_defaults will set these; nothing to validate yet
+    lower_bound = n_knots + degree + 2
+    if discrete_threshold < lower_bound:
+        raise ValueError(
+            f"shap.splines.discrete_threshold ({discrete_threshold}) must be "
+            f">= n_knots + degree + 2 ({n_knots} + {degree} + 2 = {lower_bound}). "
+            f"Spline basis is rank-deficient below this lower bound (Wood 2017, "
+            f"Generalized Additive Models, ch. 4)."
+        )
+
+
+def validate_indiv_reports_config(config: dict) -> None:
+    """Validate shap.indiv_* and shap.compute_global_on_inference keys.
+
+    Raises ValueError with precise messages on any violation:
+      - shap.indiv_ci_nboot missing, non-integer, or negative
+      - shap.indiv_scaling_mode missing or not in {raw, sd, custom_value}
+      - shap.indiv_scaling_mode == 'sd' but task_type not in {regression, multi_regression}
+      - shap.indiv_scaling_mode == 'custom_value' but shap.indiv_scaling_value missing or <= 0
+      - shap.compute_global_on_inference present but not bool
+    """
+    shap_cfg = config.get("shap", {})
+
+    # -- shap.indiv_ci_nboot --
+    nboot = shap_cfg.get("indiv_ci_nboot")
+    if nboot is None:
+        raise ValueError(
+            "shap.indiv_ci_nboot is required but missing from config. "
+            "Set to 0 to disable per-individual CI computation, or to a positive "
+            "integer (minimum recommended 2500) to enable it."
+        )
+    if not isinstance(nboot, int):
+        raise ValueError(
+            f"shap.indiv_ci_nboot must be an integer, got {type(nboot).__name__}: {nboot!r}."
+        )
+    if nboot < 0:
+        raise ValueError(
+            f"shap.indiv_ci_nboot must be >= 0, got {nboot}. "
+            "Set to 0 to disable or to a positive integer to enable."
+        )
+
+    # -- shap.indiv_scaling_mode --
+    scaling_mode = shap_cfg.get("indiv_scaling_mode")
+    if scaling_mode is None:
+        raise ValueError(
+            "shap.indiv_scaling_mode is required but missing from config. "
+            f"Must be one of: {sorted(_VALID_INDIV_SCALING_MODES)}."
+        )
+    if scaling_mode not in _VALID_INDIV_SCALING_MODES:
+        raise ValueError(
+            f"shap.indiv_scaling_mode='{scaling_mode}' is not valid. "
+            f"Must be one of: {sorted(_VALID_INDIV_SCALING_MODES)}."
+        )
+
+    # -- sd mode requires regression task --
+    if scaling_mode == "sd":
+        task_type = config.get("modeling", {}).get("task_type")
+        if task_type not in _REGRESSION_TASKS:
+            raise ValueError(
+                f"shap.indiv_scaling_mode='sd' requires a regression task; "
+                f"got task_type='{task_type}'. Use 'raw' or 'custom_value' instead."
+            )
+
+    # -- custom_value mode requires indiv_scaling_value > 0 --
+    if scaling_mode == "custom_value":
+        scaling_value = shap_cfg.get("indiv_scaling_value")
+        if scaling_value is None:
+            raise ValueError(
+                "shap.indiv_scaling_value is required when shap.indiv_scaling_mode='custom_value' "
+                "but is missing from config. Provide a positive number (e.g., outcome theoretical "
+                "maximum, minimum-meaningful-difference threshold, or any domain-specific anchor)."
+            )
+        if not isinstance(scaling_value, (int, float)) or scaling_value <= 0:
+            raise ValueError(
+                f"shap.indiv_scaling_value must be a positive number, got {scaling_value!r}."
+            )
+
+    # -- shap.compute_global_on_inference (optional, must be bool if present) --
+    cgi = shap_cfg.get("compute_global_on_inference")
+    if cgi is not None and not isinstance(cgi, bool):
+        raise ValueError(
+            f"shap.compute_global_on_inference must be a bool (true/false), "
+            f"got {type(cgi).__name__}: {cgi!r}."
+        )
+
+
+def validate_plot_config(config: dict) -> None:
+    """Validate plot.* required keys. Called only from cmd_plot (not from train/predict/infer).
+
+    Raises ValueError with precise messages on missing or wrong-typed keys:
+      - plot.outcome_max missing or non-positive number
+      - plot.negate_shap missing or not bool
+      - plot.gii_y_label / plot.gii_y_sublabel / plot.indiv_y_label / plot.indiv_y_sublabel
+        missing or empty string
+    """
+    plot_cfg = config.get("plot", {})
+
+    # -- plot.outcome_max --
+    outcome_max = plot_cfg.get("outcome_max")
+    if outcome_max is None:
+        raise ValueError(
+            "plot.outcome_max is required for the plot subcommand but is missing from config. "
+            "Provide a positive number representing the theoretical maximum of the outcome."
+        )
+    if not isinstance(outcome_max, (int, float)) or outcome_max <= 0:
+        raise ValueError(
+            f"plot.outcome_max must be a positive number, got {outcome_max!r}."
+        )
+
+    # -- plot.negate_shap --
+    negate_shap = plot_cfg.get("negate_shap")
+    if negate_shap is None:
+        raise ValueError(
+            "plot.negate_shap is required for the plot subcommand but is missing from config. "
+            "Set to true to sign-flip SHAP y-axis values, or false to display them as-is."
+        )
+    if not isinstance(negate_shap, bool):
+        raise ValueError(
+            f"plot.negate_shap must be a bool (true/false), got {type(negate_shap).__name__}: {negate_shap!r}."
+        )
+
+    # -- label strings --
+    required_labels = [
+        ("gii_y_label", "plot.gii_y_label"),
+        ("gii_y_sublabel", "plot.gii_y_sublabel"),
+        ("indiv_y_label", "plot.indiv_y_label"),
+        ("indiv_y_sublabel", "plot.indiv_y_sublabel"),
+    ]
+    for key, dotted in required_labels:
+        val = plot_cfg.get(key)
+        if val is None:
+            raise ValueError(
+                f"{dotted} is required for the plot subcommand but is missing from config."
+            )
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(
+                f"{dotted} must be a non-empty string, got {val!r}."
+            )
+
+
+# =============================================================================
+# Nominal feature helpers (used by predict.py and infer.py)
+# =============================================================================
+
+def _label_nominal(value, levels: set) -> str:
+    """Map a nominal value to a sentinel-aware label.
+
+    Returns "__NA__" if value is NaN (training-time signal: missingness may
+    itself be informative). Returns "__UNSEEN__" if value is non-NaN but not
+    in the training-time codebook `levels` (out-of-distribution; routes to
+    CatBoost prior-mean fallback). Returns the value unchanged otherwise.
+    """
+    if pd.isna(value):
+        return "__NA__"
+    if value not in levels:
+        return "__UNSEEN__"
+    return str(value)
+
+
+def _validate_nominal_unseen(
+    series: pd.Series,
+    levels: set,
+    column_name: str,
+    *,
+    tier1_unique_threshold: float = 0.50,
+    tier2_obs_threshold: float = 0.10,
+) -> None:
+    """Two-tier validation for nominal feature values not in the training codebook.
+
+    Mirrors the ordinal validation pattern at predict.py:148-169.
+
+    Tier 1 (hard error): if > 50% of unique observed values are absent from
+    `levels`, raises ValueError. Indicates misconfigured codebook or systematic
+    naming mismatch between training and inference data.
+
+    Tier 2 (loud warning): if > 10% of observations (non-NaN) have values
+    absent from `levels`, prints a warning with the exact fraction.
+    """
+    non_na = series.dropna()
+    if len(non_na) == 0:
+        return  # all-NaN column; no unseen levels possible
+    unique_observed = set(non_na.unique())
+    unseen_unique = unique_observed - levels
+    unseen_obs = non_na.isin(unseen_unique)
+
+    unique_unseen_frac = len(unseen_unique) / max(len(unique_observed), 1)
+    obs_unseen_frac = float(unseen_obs.mean())
+
+    if unique_unseen_frac > tier1_unique_threshold:
+        raise ValueError(
+            f"Nominal feature '{column_name}': "
+            f"{unique_unseen_frac:.1%} of unique observed values are absent "
+            f"from the training-time codebook (threshold: "
+            f"{tier1_unique_threshold:.0%}). This indicates a misconfigured "
+            f"codebook or systematic naming mismatch between training and "
+            f"inference data. Retrain with an expanded codebook or correct "
+            f"the inference data."
+        )
+    if obs_unseen_frac > tier2_obs_threshold:
+        warnings.warn(
+            f"Nominal feature '{column_name}': "
+            f"{obs_unseen_frac:.1%} of observations have values absent from "
+            f"the training-time codebook (threshold: "
+            f"{tier2_obs_threshold:.0%}). These will route to CatBoost "
+            f"prior-mean fallback via the '__UNSEEN__' sentinel.",
+            UserWarning,
+        )
 
 
 # =============================================================================
@@ -525,8 +759,75 @@ def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
         )
 
     if not scores:
-        return base_score, base_score, base_score
+        warnings.warn(
+            f"compute_bootstrap_ci: all bootstrap iterations dropped for "
+            f"'<unknown effect>' (n_boot_effective = 0). Returning point estimate "
+            f"with NaN CI bounds. This indicates severe data sparsity or class "
+            f"imbalance for this effect; CI is undefined.",
+            RuntimeWarning,
+        )
+        return base_score, float("nan"), float("nan")
 
     lower = np.percentile(scores, 100 * (alpha / 2))
     upper = np.percentile(scores, 100 * (1 - alpha / 2))
     return base_score, lower, upper
+
+
+# =============================================================================
+# sig_GII loader (shared by predict.py and infer.py for indiv_reports)
+# =============================================================================
+
+def _load_sig_GII_from_shap_stats(run_dir: str) -> Tuple[Dict[str, bool], Dict[Tuple[str, str], bool]]:
+    """Load sig_GII flags from the single shap_stats_global.csv.
+
+    Returns (sig_GII_main, sig_GII_interaction):
+      sig_GII_main:        {feature_name: bool}
+      sig_GII_interaction: {(feature_a, feature_b): bool}  # order as written
+
+    File path resolution:
+      - Single-output mode: read run_dir/shap_analysis/shap_stats_global.csv.
+      - Multi-output mode (no shap_analysis/ present, but shap_{slice}/ dirs exist):
+        v1 scope-limited to the first shap_*/ slice found by glob; emits an INFO log.
+
+    Raises RuntimeError if no shap_stats_global.csv can be located.
+    """
+    import glob as _glob
+
+    csv_path = os.path.join(run_dir, "shap_analysis", "shap_stats_global.csv")
+
+    if not os.path.exists(csv_path):
+        # Multi-output mode: look for shap_{slice}/ subdirectories
+        slice_dirs = sorted(_glob.glob(os.path.join(run_dir, "shap_*/")))
+        csv_path = None
+        for sd in slice_dirs:
+            candidate = os.path.join(sd, "shap_stats_global.csv")
+            if os.path.exists(candidate):
+                slice_label = os.path.basename(sd.rstrip("/"))
+                print(f"[INFO] indiv_reports using representative slice: {slice_label}")
+                csv_path = candidate
+                break
+
+    if csv_path is None or not os.path.exists(csv_path):
+        raise RuntimeError(
+            f"shap_stats_global.csv not found in run_dir '{run_dir}'; "
+            "run full predict with shap computation enabled before indiv_reports."
+        )
+
+    df = pd.read_csv(csv_path)
+
+    main_df = df[df["type"] == "Singleton"]
+    int_df = df[df["type"] != "Singleton"]
+
+    sig_GII_main: Dict[str, bool] = {
+        str(row["effect"]): bool(row["sig_GII"])
+        for _, row in main_df.iterrows()
+    }
+
+    sig_GII_interaction: Dict[Tuple[str, str], bool] = {}
+    for _, row in int_df.iterrows():
+        eff = str(row["effect"])
+        if " x " in eff:
+            a, b = eff.split(" x ", 1)
+            sig_GII_interaction[(a, b)] = bool(row["sig_GII"])
+
+    return sig_GII_main, sig_GII_interaction

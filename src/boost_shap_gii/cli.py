@@ -5,7 +5,7 @@ Provides independently callable subcommands:
     boost-shap-gii train    --config CONFIG
     boost-shap-gii predict  --config CONFIG
     boost-shap-gii infer    --config CONFIG --data DATA --output-subdir SUBDIR
-    boost-shap-gii plot     --config CONFIG --outcome-range RANGE --negate-shap BOOL --y-axis-label LABEL [--run-dir DIR]
+    boost-shap-gii plot     --config CONFIG [--run-dir DIR]
     boost-shap-gii check-env
 """
 
@@ -31,6 +31,8 @@ def _find_plot_r() -> str:
 
 def cmd_train(args: argparse.Namespace) -> None:
     """Dispatch to the train module."""
+    from .check_env import run_preflight
+    run_preflight()
     sys.argv = ["boost-shap-gii train", "--config", args.config]
     from .train import main
     main()
@@ -38,6 +40,8 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 def cmd_predict(args: argparse.Namespace) -> None:
     """Dispatch to the predict module."""
+    from .check_env import run_preflight
+    run_preflight()
     sys.argv = ["boost-shap-gii predict", "--config", args.config]
     from .predict import main
     main()
@@ -45,6 +49,8 @@ def cmd_predict(args: argparse.Namespace) -> None:
 
 def cmd_infer(args: argparse.Namespace) -> None:
     """Dispatch to the infer module."""
+    from .check_env import run_preflight
+    run_preflight()
     sys.argv = [
         "boost-shap-gii infer",
         "--config", args.config,
@@ -56,15 +62,19 @@ def cmd_infer(args: argparse.Namespace) -> None:
 
 
 def cmd_plot(args: argparse.Namespace) -> None:
-    """Dispatch to Rscript plot.R with graceful degradation if R is absent."""
+    """Dispatch to Rscript plot.R with graceful degradation if R is absent.
+
+    All plot configuration (outcome_max, negate_shap, y-axis labels) is read
+    from config.plot.* keys inside the YAML config. No positional plot flags
+    are passed on the command line.
+    """
+    from .check_env import run_preflight
+    run_preflight()
     plot_r_path = _find_plot_r()
 
     cmd = [
         "Rscript", plot_r_path,
         args.config,
-        args.outcome_range,
-        args.negate_shap,
-        args.y_axis_label,
     ]
     if args.run_dir:
         cmd.append(args.run_dir)
@@ -129,12 +139,9 @@ def main() -> None:
     # --- plot ---
     p_plot = subparsers.add_parser(
         "plot",
-        help="Generate SHAP/GII visualizations via Rscript.",
+        help="Generate SHAP/GII and per-individual visualizations via Rscript.",
     )
     p_plot.add_argument("--config", required=True, help="Path to config YAML.")
-    p_plot.add_argument("--outcome-range", required=True, help="Theoretical maximum of outcome measure.")
-    p_plot.add_argument("--negate-shap", required=True, help="'true' or 'false' to reverse SHAP y-axis.")
-    p_plot.add_argument("--y-axis-label", required=True, help="Y-axis label for SHAP plots.")
     p_plot.add_argument("--run-dir", required=False, default=None, help="Override run directory (for inference plots).")
     p_plot.set_defaults(func=cmd_plot)
 

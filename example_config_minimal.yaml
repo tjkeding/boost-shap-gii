@@ -55,3 +55,16 @@ features:
 
 modeling:
   outcome: "outcome_total"    # String for single outcome; list for multi_regression (e.g., ["y1", "y2"])
+
+shap:
+  indiv_ci_nboot: 2500        # Number of coupled bootstrap iterations for per-individual SHAP CIs. 0 disables.
+  indiv_scaling_mode: "sd"    # Scaling mode: raw, sd (regression only), or custom_value
+  # indiv_scaling_value: 1.0  # Required only when indiv_scaling_mode=custom_value; must be > 0
+
+plot:
+  outcome_max: 100.0          # Theoretical maximum value of the outcome (scales GII magnitudes on plots)
+  negate_shap: false          # If true, SHAP y-axis values are sign-flipped on GII and indiv plots
+  gii_y_label: "Global Importance Index (GII)"
+  gii_y_sublabel: "SHAP-based feature importance"
+  indiv_y_label: "SHAP Value (scaled)"
+  indiv_y_sublabel: "Per-individual contribution to predicted outcome"

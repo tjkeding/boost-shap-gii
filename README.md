@@ -69,8 +69,10 @@ boost-shap-gii infer --config resolved_config.yaml --data new_data.csv --output-
 
 **Visualization of significant effects (requires R):**
 ```bash
-boost-shap-gii plot --config config.yaml --outcome-range RANGE --negate-shap true --y-axis-label "Label"
+boost-shap-gii plot --config config.yaml
 ```
+
+**Per-individual SHAP reports (optional, configuration-driven):** Set `shap.indiv_ci_nboot > 0` in the config to enable per-individual SHAP bootstrap CIs during `predict` and `infer`. Reports are written to `indiv_reports/` within the output directory.
 
 #### Alternative: Shell Script
 
@@ -78,12 +80,12 @@ The shell script orchestrator is available as an alternative interface. It autom
 
 **Training & SHAP Analysis:**
 ```bash
-bash run_boost-shap-gii.sh train config.yaml OUTCOME_RANGE NEGATE_SHAP Y_AXIS_LABEL
+bash run_boost-shap-gii.sh train config.yaml
 ```
 
 **Inference on New Data:**
 ```bash
-bash run_boost-shap-gii.sh infer train_config.yaml new_data.csv sub_dir OUTCOME_RANGE NEGATE_SHAP Y_AXIS_LABEL
+bash run_boost-shap-gii.sh infer train_config.yaml new_data.csv sub_dir
 ```
 
 ---
@@ -133,6 +135,21 @@ Singleton effects (Φ[i,i]) are extracted from the SHAP interaction matrix diago
 
 ### Boruta Noise Baseline is Model-Adaptive
 The shadow noise distribution used for significance testing is derived from a shadow model trained jointly on real and permuted features. This means the noise baseline is adaptive: it represents how important noise features are *in the presence of the real signal*. When the real features are strongly predictive, shadow features receive lower SHAP attribution, reducing the noise threshold. This is the correct null for the Boruta framework and is not a conservatism concern.
+
+---
+
+## Per-individual SHAP reports
+
+When `shap.indiv_ci_nboot > 0`, each `predict` and `infer` run generates per-individual SHAP attribution plots with bootstrap confidence intervals. Reports are written to `indiv_reports/` within the respective output directory.
+
+**Required configuration keys:**
+
+- `shap.indiv_ci_nboot` (integer): bootstrap iterations; set to `0` to disable. Minimum recommended `2500`; `5000` for peer-review runs.
+- `shap.indiv_scaling_mode` (string): one of `raw`, `sd` (regression only), or `custom_value`.
+- `shap.indiv_scaling_value` (number): user-supplied divisor; required when `indiv_scaling_mode: custom_value`.
+- `shap.compute_global_on_inference` (bool, default `false`): when `true`, `infer` also emits population-level GII on the inference set.
+
+See `INPUT_SPECIFICATION.md` Section 10 for the full algorithmic description, CI interpretation, and output schema.
 
 ---
 

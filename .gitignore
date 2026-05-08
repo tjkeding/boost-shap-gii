@@ -22,6 +22,7 @@
 !src/boost_shap_gii/shap_utils.py
 !src/boost_shap_gii/utils.py
 !src/boost_shap_gii/check_env.py
+!src/boost_shap_gii/indiv_reports.py
 !src/boost_shap_gii/scripts/
 !src/boost_shap_gii/scripts/plot.R
 !src/boost_shap_gii/scripts/run_boost-shap-gii.sh

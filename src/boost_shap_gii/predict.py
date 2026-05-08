@@ -16,6 +16,9 @@ from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 
 from .utils import (
     _normalize_quotes,
+    _label_nominal,
+    _validate_nominal_unseen,
+    _load_sig_GII_from_shap_stats,
     load_config,
     save_json_atomic,
     detect_task,
@@ -25,6 +28,7 @@ from .utils import (
     get_scoring_function,
     compute_bootstrap_ci,
     compute_permutation_test,
+    validate_indiv_reports_config,
 )
 
 from .shap_utils import run_shap_pipeline
@@ -130,9 +134,18 @@ def main():
     nom_feats = [c for c, t in feature_types.items() if t == 'nominal']
 
     # A. Cast Nominals (String -> Category).
-    # NaN -> "__NA__" (literal string level). See train.py and README for rationale.
+    # NaN -> "__NA__" (informative-missing sentinel); unseen level -> "__UNSEEN__" (OOD sentinel).
+    # Levels are read from the training-time nominal codebook in feature_metadata.json.
+    nominal_codebooks = feature_meta.get("nominal_codebooks", {})
     for c in nom_feats:
-        X[c] = df_raw[c].fillna("__NA__").astype(str).astype("category")
+        # Distinguish NaN (informative-missing) from unseen-level (OOD) at predict-time.
+        levels = set(nominal_codebooks.get(c, []))  # training-time codebook for column c
+        if levels:
+            _validate_nominal_unseen(df_raw[c], levels, column_name=c)
+            X[c] = df_raw[c].apply(lambda v: _label_nominal(v, levels)).astype(str).astype("category")
+        else:
+            # Fallback: no codebook persisted (legacy training run); preserve prior behavior
+            X[c] = df_raw[c].astype(object).fillna("__NA__").astype(str).astype("category")
 
     # B. Cast Continuous (Float32)
     for c in con_feats:
@@ -441,6 +454,54 @@ def main():
     }
 
     run_shap_pipeline(shap_ctx)
+
+    # --- Per-individual SHAP reports (indiv_reports) ---
+    validate_indiv_reports_config(config)
+
+    nboot_indiv = int(config["shap"]["indiv_ci_nboot"])
+    if nboot_indiv > 0:
+        from .indiv_reports import orchestrate_bootstrap_cache, generate_indiv_reports
+
+        n_jobs = config["execution"].get("n_jobs", 1)
+
+        # 1. Build cache at run_dir/bootstrap_refits/
+        cache_summary = orchestrate_bootstrap_cache(
+            run_dir=run_dir,
+            X_train=X,
+            y_train=y,
+            task=task,
+            outcome_cols=outcome_cols,
+            nom_feats=nom_feats,
+            config=config,
+            n_jobs=n_jobs,
+            random_seed=config["execution"]["random_seed"],
+        )
+        print(
+            f"[INFO] Bootstrap cache built: B={cache_summary['B']} iterations "
+            f"across K={cache_summary['K']} folds "
+            f"({cache_summary['total_refits']} total refits)."
+        )
+
+        # 2. Emit training-individual indiv_reports
+        sig_GII_main, sig_GII_interaction = _load_sig_GII_from_shap_stats(run_dir)
+        generate_indiv_reports(
+            run_dir=run_dir,
+            train_dir=run_dir,  # in predict.py, train_dir == run_dir
+            X_target=X,
+            ids_target=ids,
+            X_train=X,
+            y_target=y,
+            task=task,
+            outcome_cols=outcome_cols,
+            nom_feats=nom_feats,
+            config=config,
+            mode="training",
+            sig_GII_main=sig_GII_main,
+            sig_GII_interaction=sig_GII_interaction,
+        )
+        print(f"[INFO] Training indiv_reports/ emitted to {run_dir}.")
+    else:
+        print("[INFO] shap.indiv_ci_nboot=0; skipping per-individual SHAP reports.")
 
 if __name__ == "__main__":
     main()

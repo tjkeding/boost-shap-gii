@@ -1,9 +1,14 @@
 #!/usr/bin/env Rscript
 
 # -----------------------------------------------------------------------------
-# SHAP Visualization Engine (GII Density + V-Component Splines)
+# SHAP Visualization Engine (GII Density + V-Component Splines + indiv_reports)
 # -----------------------------------------------------------------------------
 # Dependencies: ggplot2, dplyr, nanoparquet, tidyr, foreach, doParallel, gridExtra, splines
+# -----------------------------------------------------------------------------
+# calc_v_spline_pred uses splines::splineDesign with adaptive-knot LSQ fitting
+# that mirrors scipy.interpolate.LSQUnivariateSpline as used in
+# shap_utils.py:146-164. Visualization fits are consistent with the
+# V-statistic shown beneath them.
 # -----------------------------------------------------------------------------
 
 # --- 1. USER CONFIGURATION ---------------------------------------------------
@@ -11,27 +16,12 @@
 args <- commandArgs(trailingOnly = TRUE)
 
 # Check if at least one argument is provided
-if (length(args) < 4) {
-  stop("At least 4 arguments must be supplied: CONFIG_PATH, OUTCOME_RANGE, NEGATE_SHAP, Y_AXIS_LABEL.", call. = FALSE)
+if (length(args) < 1) {
+  stop("At least 1 argument must be supplied: CONFIG_PATH", call. = FALSE)
 }
 
-# Get config
+# Get config path (required)
 CONFIG_PATH <- args[1]
-
-# Max score of the outcome for this run (used for scaling)
-OUTCOME_RANGE <- as.numeric(args[2])
-
-# Flag to negate SHAP values for interpretability
-NEGATE_SHAP <- as.logical(args[3])
-
-# Y-axis labels that will need to be changed based on outcome
-Y_AXIS_LABEL <- paste0(args[4])
-if (NEGATE_SHAP){
-    Y_AXIS_SUBLABEL <- "(Negative SHAP %)"
-}else{
-    Y_AXIS_SUBLABEL <- "(SHAP %)"
-}
-
 
 # -----------------------------------------------------------------------------
 # 2. SETUP & LIBRARIES
@@ -56,10 +46,27 @@ suppressPackageStartupMessages({
 # Path to the YAML config used for this run
 cfg <- yaml::read_yaml(CONFIG_PATH)
 
-# The directory of the current run to plot (can be overridden by 5th arg for inference)
+# Validate required plot.* keys from config
+plot_cfg <- cfg$plot
+required_keys <- c("outcome_max", "negate_shap", "gii_y_label", "gii_y_sublabel",
+                   "indiv_y_label", "indiv_y_sublabel")
+missing_keys <- setdiff(required_keys, names(plot_cfg))
+if (length(missing_keys) > 0) {
+  stop(sprintf("Missing required plot.* config keys: %s",
+               paste(missing_keys, collapse = ", ")), call. = FALSE)
+}
+
+OUTCOME_MAX    <- as.numeric(plot_cfg$outcome_max)
+NEGATE_SHAP    <- as.logical(plot_cfg$negate_shap)
+GII_Y_LABEL    <- plot_cfg$gii_y_label
+GII_Y_SUBLABEL <- plot_cfg$gii_y_sublabel
+INDIV_Y_LABEL    <- plot_cfg$indiv_y_label
+INDIV_Y_SUBLABEL <- plot_cfg$indiv_y_sublabel
+
+# The directory of the current run to plot (can be overridden by 2nd arg for inference)
 RUN_DIR <- cfg$paths$output_dir
-if (length(args) >= 5) {
-  RUN_DIR <- args[5]
+if (length(args) >= 2) {
+  RUN_DIR <- args[2]
 }
 
 # Read available cores for parallel processing; cap at physical core count.
@@ -106,16 +113,53 @@ cat(sprintf("[INFO] Parallel backend registered with %d cores.\n", N_CORES))
 # Flag to ensure performance plot is only generated once across SHAP dirs
 perf_plotted_flag <- FALSE
 
+# OOB floor constant (must match indiv_reports.py OOB_FLOOR_MIN)
+OOB_FLOOR_MIN <- 50L
+
 # -----------------------------------------------------------------------------
 # 3. HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
 
+# Null-coalescing operator (not in base R; mirrors rlang::`%||%`)
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Python equivalent: shap_utils.py:_get_adaptive_knots_and_degree (lines 146-164)
+# Returns a list with `interior_knots` (vector) and `degree` (integer).
+get_adaptive_knots_and_degree <- function(x_values, n_knots_target, degree_target) {
+  # Sort and uniquify
+  x_unique <- sort(unique(x_values[!is.na(x_values)]))
+  n_unique <- length(x_unique)
+
+  if (n_unique < 2) {
+    return(list(interior_knots = numeric(0), degree = 1L))
+  }
+
+  # Percentile-based interior knots; type=7 matches numpy's default
+  probs <- seq(0, 1, length.out = n_knots_target + 2)
+  probs <- probs[2:(length(probs) - 1)]  # exclude 0 and 1 (boundary exclusion)
+  candidate_knots <- quantile(x_unique, probs = probs, type = 7, names = FALSE)
+
+  # Drop duplicate knots (occurs when the data is highly discrete)
+  interior_knots <- unique(candidate_knots)
+
+  # Boundary exclusion: drop knots at min/max of x_unique
+  x_min <- min(x_unique)
+  x_max <- max(x_unique)
+  interior_knots <- interior_knots[interior_knots > x_min & interior_knots < x_max]
+
+  # Degree downgrade: if fewer than 4 unique interior knots, downgrade to linear (degree=1)
+  effective_degree <- ifelse(length(interior_knots) < 4, 1L, as.integer(degree_target))
+  return(list(interior_knots = interior_knots, degree = effective_degree))
+}
+
 # VISUALIZATION-ONLY spline for plotting trend lines.
-# Uses R's bs() (B-spline basis via lm), NOT the same spline used for V-component
-# calculation in shap_utils.py (which uses scipy LSQUnivariateSpline).
-# Different fitting methods → different curves. The V values in shap_stats_global.csv
-# are authoritative; this function only approximates the trend for display purposes.
-calc_v_spline_pred <- function(x, y, k, degree) {
+# Uses splines::splineDesign with adaptive-knot LSQ fitting that mirrors
+# scipy.interpolate.LSQUnivariateSpline as used in shap_utils.py:146-164.
+# Knot parameters are read from cfg$shap$splines at call time.
+calc_v_spline_pred <- function(x, y, cfg) {
+  n_knots_target <- cfg$shap$splines$n_knots %||% 4L
+  degree_target <- cfg$shap$splines$degree %||% 3L
+
   valid <- !is.na(x) & !is.na(y) & !is.nan(x) & !is.nan(y)
   if (sum(valid) < 2) return(data.frame(x = numeric(0), y_pred = numeric(0)))
 
@@ -125,21 +169,34 @@ calc_v_spline_pred <- function(x, y, k, degree) {
   xs <- xs[ord]
   ys <- ys[ord]
 
-  if (length(unique(xs)) < (degree + 1)) {
-    mod <- lm(ys ~ xs)
-    pred <- predict(mod)
-  } else {
-    probs <- seq(0, 1, length.out = k + 2)[-c(1, k + 2)]
-    knots <- unique(quantile(xs, probs = probs, names = FALSE))
-    tryCatch({
-      mod <- lm(ys ~ bs(xs, knots = knots, degree = degree))
-      pred <- predict(mod)
-    }, error = function(e) {
-      mod <- lm(ys ~ xs)
-      pred <- predict(mod)
-    })
+  knot_info <- get_adaptive_knots_and_degree(xs, n_knots_target, degree_target)
+  interior_knots <- knot_info$interior_knots
+  degree <- knot_info$degree
+
+  if (length(xs) < degree + length(interior_knots) + 2L) {
+    # Insufficient unique x for stable LSQ; return NA-filled predictions
+    return(data.frame(x = xs, y_pred = rep(NA_real_, length(xs))))
   }
-  return(data.frame(x = xs, y_pred = pred))
+
+  # Construct knot sequence with degree+1 multiplicity at boundaries
+  x_min <- min(xs, na.rm = TRUE)
+  x_max <- max(xs, na.rm = TRUE)
+  knot_seq <- c(rep(x_min, degree + 1L), interior_knots, rep(x_max, degree + 1L))
+
+  # Build B-spline design matrix
+  basis <- tryCatch(
+    splines::splineDesign(knots = knot_seq, x = xs, ord = degree + 1L, outer.ok = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(basis)) return(data.frame(x = xs, y_pred = rep(NA_real_, length(xs))))
+
+  # LSQ fit (mirrors scipy.interpolate.LSQUnivariateSpline)
+  # Solve: coef = (B^T B)^-1 B^T y
+  fit <- tryCatch(qr.solve(basis, ys), error = function(e) NULL)
+  if (is.null(fit)) return(data.frame(x = xs, y_pred = rep(NA_real_, length(xs))))
+
+  preds <- as.vector(basis %*% fit)
+  return(data.frame(x = xs, y_pred = preds))
 }
 
 find_zero_crossing <- function(df_trend) {
@@ -172,7 +229,7 @@ get_red_blue_palette <- function(n) {
 }
 
 # -----------------------------------------------------------------------------
-# 4. DATA LOADING & PLOTTING (per SHAP directory)
+# 4. DATA LOADING & GII PLOTTING (per SHAP directory)
 # -----------------------------------------------------------------------------
 
 for (SHAP_DIR in shap_dirs) {
@@ -290,7 +347,7 @@ df_boot <- read_parquet(boot_path)
 df_noise <- read_parquet(noise_path)
 
 # -----------------------------------------------------------------------------
-# 5. PLOTTING LOOP
+# 5. GII PLOTTING LOOP
 # -----------------------------------------------------------------------------
 
 if (nrow(df_sig) == 0) {
@@ -373,20 +430,26 @@ results <- foreach(i = 1:nrow(df_sig), .packages = c("ggplot2", "dplyr", "spline
 
   if (nrow(df_m) == 0) return(sprintf("Skipped %s: No valid data after filtering", feat_name))
 
-  # TRANSFORM SHAP
+  # TRANSFORM SHAP (sign-flip only; color/ordering anchored to raw signed SHAP)
   if (NEGATE_SHAP){
     df_m$shap_value <- -df_m$shap_value
   }
-  df_m$shap_value <- (df_m$shap_value / OUTCOME_RANGE) * 100
+  # Skip OUTCOME_MAX scaling for multi_regression: SHAP values are on z-scaled
+  # targets (StandardScaler applied in train.py), so percent-of-max rescaling
+  # would create a unit mismatch.
+  task_type <- cfg$modeling$task_type
+  if (!identical(task_type, "multi_regression")) {
+    df_m$shap_value <- (df_m$shap_value / OUTCOME_MAX) * 100
+  }
 
   p2 <- NULL
   legend_title <- "Feature Value"
 
   # --- CUSTOM Y-AXIS LABEL GROB ---
   # Transparent background implicit in textGrob
-  y_grob_title <- textGrob(Y_AXIS_LABEL, rot = 90,
+  y_grob_title <- textGrob(GII_Y_LABEL, rot = 90,
                            gp = gpar(fontsize = 5.5, fontface = "bold", col = "black"))
-  y_grob_sub   <- textGrob(Y_AXIS_SUBLABEL, rot = 90,
+  y_grob_sub   <- textGrob(GII_Y_SUBLABEL, rot = 90,
                            gp = gpar(fontsize = 4.5, fontface = "plain", col = "black"))
 
   y_axis_grob <- arrangeGrob(y_grob_title, y_grob_sub, ncol = 2,
@@ -446,7 +509,7 @@ results <- foreach(i = 1:nrow(df_sig), .packages = c("ggplot2", "dplyr", "spline
     if (!is_discrete) {
       # CONTINUOUS
       df_m$x_plot <- as.numeric(df_m$feature_value)
-      trend_data <- calc_v_spline_pred(df_m$x_plot, df_m$shap_value, SPLINE_K_KNOTS, SPLINE_DEGREE)
+      trend_data <- calc_v_spline_pred(df_m$x_plot, df_m$shap_value, cfg)
       x_cross <- find_zero_crossing(trend_data)
 
       axis_seg <- geom_segment(aes(x = min(df_m$x_plot), xend = max(df_m$x_plot), y = -Inf, yend = -Inf),
@@ -473,14 +536,47 @@ results <- foreach(i = 1:nrow(df_sig), .packages = c("ggplot2", "dplyr", "spline
     } else {
       # DISCRETE SINGLETON
       fac <- create_ordered_factor(df_m$main_feature_raw, df_m$feature_value)
+      # V-contribution-ranked top-5 selection (NOMINAL only).
+      # V_nominal is the ANOVA between-group SS contribution per level:
+      #   contribution_k = count_k * (mean_SHAP_k - grand_mean_SHAP)^2
+      # Ranking by this contribution exactly matches the per-level contribution to
+      # the V-statistic shown in the plot.
+      level_label_lookup <- NULL
       if (m_type == "nominal" && nlevels(fac) > 5) {
-        top <- names(sort(table(fac), decreasing = TRUE))[1:5]
-        df_m <- df_m %>% filter(create_ordered_factor(main_feature_raw, feature_value) %in% top)
+        grand_mean_shap <- mean(df_m$shap_value, na.rm = TRUE)
+        level_contrib <- df_m %>%
+          group_by(feature_value) %>%
+          summarise(
+            n_k = n(),
+            mean_shap_k = mean(shap_value, na.rm = TRUE),
+            contribution = n() * (mean(shap_value, na.rm = TRUE) - grand_mean_shap) ^ 2,
+            .groups = "drop"
+          ) %>%
+          arrange(desc(contribution))
+
+        top <- as.character(level_contrib$feature_value[1:5])
+        df_m <- df_m %>% filter(as.character(feature_value) %in% top)
         fac <- create_ordered_factor(df_m$main_feature_raw, df_m$feature_value)
+
+        # Annotate N_k below each surviving level for transparency.
+        level_labels_nk <- df_m %>%
+          group_by(feature_value) %>%
+          summarise(n_k = n(), .groups = "drop")
+        level_label_lookup <- setNames(
+          paste0(level_labels_nk$feature_value, "\n(N=", level_labels_nk$n_k, ")"),
+          as.character(level_labels_nk$feature_value)
+        )
       }
 
       df_m$x_plot <- as.integer(fac)
-      x_labels <- levels(fac)
+      x_labels <- if (!is.null(level_label_lookup)) {
+        # Map ordered factor levels through the N_k lookup; fall back to bare
+        # level name if a level is not found (defensive; should not occur).
+        lvls <- levels(fac)
+        ifelse(lvls %in% names(level_label_lookup), level_label_lookup[lvls], lvls)
+      } else {
+        levels(fac)
+      }
       n_lev <- length(x_labels)
       capacity <- if(n_lev == 2) 7 else if(n_lev == 3) 6 else if(n_lev == 4) 5.5 else n_lev + 0.5
 
@@ -560,3 +656,390 @@ results <- foreach(i = 1:nrow(df_sig), .packages = c("ggplot2", "dplyr", "spline
 cat(sprintf("[INFO] Done plotting for %s.\n", shap_label))
 
 }  # end for (SHAP_DIR in shap_dirs)
+
+# -----------------------------------------------------------------------------
+# 6. PER-INDIVIDUAL SHAP PLOTS (indiv_reports)
+# -----------------------------------------------------------------------------
+
+render_indiv_main_effects_plots <- function(path, out_dir, y_label, y_sublabel, negate_flag, n_cores) {
+  # Load long-format parquet (one row per individual x feature, all features)
+  df_all <- tryCatch(
+    read_parquet(path),
+    error = function(e) {
+      cat(sprintf("[WARNING] Could not read main_effects.parquet: %s\n", e$message))
+      return(NULL)
+    }
+  )
+  if (is.null(df_all) || nrow(df_all) == 0) {
+    cat("[INFO] main_effects.parquet is empty or unreadable; skipping individual main-effects plots.\n")
+    return(invisible(NULL))
+  }
+
+  # Create output directory
+  indiv_plot_dir <- file.path(out_dir, "plots")
+  if (!dir.exists(indiv_plot_dir)) dir.create(indiv_plot_dir, recursive = TRUE)
+
+  # Filter to sig_GII=TRUE features
+  if ("sig_GII" %in% names(df_all)) {
+    df_sig <- df_all %>% filter(sig_GII == TRUE | sig_GII == "True" | sig_GII == "TRUE")
+  } else {
+    df_sig <- df_all
+  }
+
+  if (nrow(df_sig) == 0) {
+    cat("[INFO] No sig_GII=TRUE features in main_effects.parquet; skipping individual main-effects plots.\n")
+    return(invisible(NULL))
+  }
+
+  # Get list of unique individual IDs
+  ids <- unique(df_sig$id)
+  cat(sprintf("[INFO] Rendering per-individual main-effects plots for %d individuals.\n", length(ids)))
+
+  # Build y-axis label grob constructor (used inside mclapply)
+  make_y_grob <- function(y_lbl, y_sub) {
+    y_grob_title <- textGrob(y_lbl, rot = 90,
+                             gp = gpar(fontsize = 7, fontface = "bold", col = "black"))
+    if (nchar(trimws(y_sub)) > 0) {
+      y_grob_sub <- textGrob(y_sub, rot = 90,
+                             gp = gpar(fontsize = 5.5, fontface = "plain", col = "black"))
+      arrangeGrob(y_grob_title, y_grob_sub, ncol = 2,
+                  widths = unit(c(3.0, 2.5), "mm"))
+    } else {
+      y_grob_title
+    }
+  }
+
+  # Detect multiclass schema: main_effects.parquet has a 'class' column when n_outputs > 1.
+  is_multiclass_main <- "class" %in% names(df_sig)
+
+  plot_one_individual <- function(indiv_id) {
+    tryCatch({
+      df_i <- df_sig %>% filter(id == indiv_id)
+
+      if (nrow(df_i) == 0) {
+        return(sprintf("[SKIP] %s: no sig_GII features", indiv_id))
+      }
+
+      # For multiclass tasks, split by class and produce one plot per (individual, class).
+      # For non-multiclass tasks, produce a single plot per individual.
+      class_levels <- if (is_multiclass_main) unique(as.character(df_i[["class"]])) else NA_character_
+
+      msgs <- c()
+      for (cl_val in class_levels) {
+        if (is_multiclass_main) {
+          df_c <- df_i %>% filter(as.character(.data[["class"]]) == cl_val)
+        } else {
+          df_c <- df_i
+        }
+
+        if (nrow(df_c) == 0) next
+
+        # Determine below-OOB-floor status: if ANY feature has oob_count < OOB_FLOOR_MIN
+        below_floor <- FALSE
+        if ("oob_count" %in% names(df_c)) {
+          below_floor <- any(!is.na(df_c$oob_count) & df_c$oob_count < OOB_FLOOR_MIN)
+        }
+
+        # x-axis ordering: features ordered by RAW signed SHAP (descending, most positive left)
+        if ("shap_value_raw" %in% names(df_c)) {
+          df_c <- df_c %>% arrange(desc(shap_value_raw))
+          raw_order <- df_c$feature
+          df_c$feature <- factor(df_c$feature, levels = raw_order)
+          color_col <- df_c$shap_value_raw
+        } else {
+          df_c <- df_c %>% arrange(desc(shap_value_scaled))
+          raw_order <- df_c$feature
+          df_c$feature <- factor(df_c$feature, levels = raw_order)
+          color_col <- df_c$shap_value_scaled
+        }
+
+        # y-axis values: shap_value_scaled with optional sign-flip
+        y_vals <- df_c$shap_value_scaled
+        if (negate_flag) y_vals <- -y_vals
+        df_c$y_plot <- y_vals
+
+        # CI bounds with sign-flip applied (bounds swap when negated)
+        if ("shap_value_ci_lo" %in% names(df_c) && "shap_value_ci_hi" %in% names(df_c)) {
+          if (negate_flag) {
+            ci_lo <- -df_c$shap_value_ci_hi
+            ci_hi <- -df_c$shap_value_ci_lo
+          } else {
+            ci_lo <- df_c$shap_value_ci_lo
+            ci_hi <- df_c$shap_value_ci_hi
+          }
+        } else {
+          ci_lo <- rep(NA_real_, nrow(df_c))
+          ci_hi <- rep(NA_real_, nrow(df_c))
+        }
+        df_c$ci_lo_plot <- ci_lo
+        df_c$ci_hi_plot <- ci_hi
+        df_c$color_raw  <- color_col
+
+        # Build plot
+        p <- ggplot(df_c, aes(x = feature, y = y_plot, color = color_raw)) +
+          geom_hline(yintercept = 0, color = "gray50", linewidth = 0.3, linetype = "dashed") +
+          geom_point(size = 2.0) +
+          scale_color_gradient2(
+            low = "#b2182b", mid = "white", high = "#2166ac",
+            midpoint = 0, guide = "none"
+          ) +
+          scale_x_discrete() +
+          theme_minimal(base_size = 8) +
+          theme(
+            axis.title.x = element_text(size = 6, face = "bold"),
+            axis.title.y = element_blank(),
+            axis.text.x = element_text(size = 5.5, angle = 45, hjust = 1),
+            panel.grid.major = element_line(color = "grey92"),
+            panel.grid.minor = element_blank(),
+            panel.border = element_blank(),
+            plot.background = element_rect(fill = "transparent", color = NA),
+            plot.margin = unit(c(2, 2, 2, 2), "mm"),
+            plot.caption = element_text(size = 5, hjust = 0, margin = margin(t = 4))
+          ) +
+          labs(x = "Feature", y = NULL)
+
+        # Add whiskers only for compliant plots (not below-floor)
+        if (!below_floor) {
+          p <- p + geom_errorbar(
+            aes(ymin = ci_lo_plot, ymax = ci_hi_plot),
+            width = 0.2, linewidth = 0.5, na.rm = TRUE
+          )
+        } else {
+          p <- p + labs(
+            caption = "CI unavailable (oob_count < 50); point estimate shown only."
+          )
+        }
+
+        # Y-axis grob
+        y_axis_grob <- make_y_grob(y_label, y_sublabel)
+
+        # Save: multiclass uses <id>_main_effects_<label>.png; non-multiclass uses <id>_main_effects.png
+        safe_id <- str_replace_all(as.character(indiv_id), "[^a-zA-Z0-9_\\-]", "_")
+        if (is_multiclass_main) {
+          safe_cl <- str_replace_all(as.character(cl_val), "[^a-zA-Z0-9_\\-]", "_")
+          fname <- sprintf("%s_main_effects_%s.png", safe_id, safe_cl)
+        } else {
+          fname <- sprintf("%s_main_effects.png", safe_id)
+        }
+        fpath <- file.path(indiv_plot_dir, fname)
+
+        p_with_axis <- arrangeGrob(p, left = y_axis_grob)
+        ggsave(fpath, p_with_axis, width = 10, height = 5, dpi = 300, bg = "transparent")
+        msgs <- c(msgs, sprintf("Saved: %s", fname))
+      }
+      return(paste(msgs, collapse = "; "))
+    }, error = function(e) {
+      return(sprintf("[ERROR] individual %s: %s", indiv_id, e$message))
+    })
+  }
+
+  # Parallelize over individuals using mclapply (Unix) or lapply (Windows fallback)
+  if (.Platform$OS.type == "unix") {
+    results_indiv <- parallel::mclapply(ids, plot_one_individual, mc.cores = n_cores)
+  } else {
+    results_indiv <- lapply(ids, plot_one_individual)
+  }
+
+  for (msg in results_indiv) {
+    cat(sprintf("[INFO] %s\n", msg))
+  }
+  invisible(NULL)
+}
+
+
+render_indiv_interactions_plots <- function(path, out_dir, y_label, y_sublabel, negate_flag, n_cores) {
+  # Load long-format parquet for interactions (already filtered to sig_GII=TRUE at emission)
+  df_all <- tryCatch(
+    read_parquet(path),
+    error = function(e) {
+      cat(sprintf("[WARNING] Could not read interactions.parquet: %s\n", e$message))
+      return(NULL)
+    }
+  )
+
+  if (is.null(df_all) || nrow(df_all) == 0) {
+    cat("[INFO] interactions.parquet is empty or unreadable; skipping individual interactions plots.\n")
+    return(invisible(NULL))
+  }
+
+  # Create output directory
+  indiv_plot_dir <- file.path(out_dir, "plots")
+  if (!dir.exists(indiv_plot_dir)) dir.create(indiv_plot_dir, recursive = TRUE)
+
+  # Construct composite x-axis label: feature_a x feature_b
+  if ("feature_a" %in% names(df_all) && "feature_b" %in% names(df_all)) {
+    df_all <- df_all %>%
+      mutate(pair_label = paste0(feature_a, " × ", feature_b))
+  } else if ("feature" %in% names(df_all)) {
+    # Fall back if parquet uses a single composite column
+    df_all <- df_all %>% mutate(pair_label = feature)
+  } else {
+    cat("[WARNING] interactions.parquet has unexpected schema; skipping individual interactions plots.\n")
+    return(invisible(NULL))
+  }
+
+  ids <- unique(df_all$id)
+  cat(sprintf("[INFO] Rendering per-individual interactions plots for %d individuals.\n", length(ids)))
+
+  # Detect multiclass schema: interactions.parquet has a 'class' column when n_outputs > 1.
+  is_multiclass_int <- "class" %in% names(df_all)
+
+  make_y_grob <- function(y_lbl, y_sub) {
+    y_grob_title <- textGrob(y_lbl, rot = 90,
+                             gp = gpar(fontsize = 7, fontface = "bold", col = "black"))
+    if (nchar(trimws(y_sub)) > 0) {
+      y_grob_sub <- textGrob(y_sub, rot = 90,
+                             gp = gpar(fontsize = 5.5, fontface = "plain", col = "black"))
+      arrangeGrob(y_grob_title, y_grob_sub, ncol = 2,
+                  widths = unit(c(3.0, 2.5), "mm"))
+    } else {
+      y_grob_title
+    }
+  }
+
+  plot_one_individual_int <- function(indiv_id) {
+    tryCatch({
+      df_i <- df_all %>% filter(id == indiv_id)
+
+      if (nrow(df_i) == 0) {
+        return(sprintf("[SKIP] %s: no interactions data", indiv_id))
+      }
+
+      # For multiclass tasks, split by class and produce one plot per (individual, class).
+      class_levels_int <- if (is_multiclass_int) unique(as.character(df_i[["class"]])) else NA_character_
+
+      msgs <- c()
+      for (cl_val in class_levels_int) {
+        if (is_multiclass_int) {
+          df_c <- df_i %>% filter(as.character(.data[["class"]]) == cl_val)
+        } else {
+          df_c <- df_i
+        }
+
+        if (nrow(df_c) == 0) next
+
+        # Determine below-OOB-floor status
+        below_floor <- FALSE
+        if ("oob_count" %in% names(df_c)) {
+          below_floor <- any(!is.na(df_c$oob_count) & df_c$oob_count < OOB_FLOOR_MIN)
+        }
+
+        # Order pairs by RAW signed SHAP (descending)
+        if ("shap_value_raw" %in% names(df_c)) {
+          df_c <- df_c %>% arrange(desc(shap_value_raw))
+          color_col <- df_c$shap_value_raw
+        } else {
+          df_c <- df_c %>% arrange(desc(shap_value_scaled))
+          color_col <- df_c$shap_value_scaled
+        }
+        df_c$pair_label <- factor(df_c$pair_label, levels = unique(df_c$pair_label))
+
+        # y-axis values with optional sign-flip
+        y_vals <- df_c$shap_value_scaled
+        if (negate_flag) y_vals <- -y_vals
+        df_c$y_plot   <- y_vals
+        df_c$color_raw <- color_col
+
+        # CI bounds
+        if ("shap_value_ci_lo" %in% names(df_c) && "shap_value_ci_hi" %in% names(df_c)) {
+          if (negate_flag) {
+            ci_lo <- -df_c$shap_value_ci_hi
+            ci_hi <- -df_c$shap_value_ci_lo
+          } else {
+            ci_lo <- df_c$shap_value_ci_lo
+            ci_hi <- df_c$shap_value_ci_hi
+          }
+        } else {
+          ci_lo <- rep(NA_real_, nrow(df_c))
+          ci_hi <- rep(NA_real_, nrow(df_c))
+        }
+        df_c$ci_lo_plot <- ci_lo
+        df_c$ci_hi_plot <- ci_hi
+
+        p <- ggplot(df_c, aes(x = pair_label, y = y_plot, color = color_raw)) +
+          geom_hline(yintercept = 0, color = "gray50", linewidth = 0.3, linetype = "dashed") +
+          geom_point(size = 2.0) +
+          scale_color_gradient2(
+            low = "#b2182b", mid = "white", high = "#2166ac",
+            midpoint = 0, guide = "none"
+          ) +
+          scale_x_discrete() +
+          theme_minimal(base_size = 8) +
+          theme(
+            axis.title.x = element_text(size = 6, face = "bold"),
+            axis.title.y = element_blank(),
+            axis.text.x = element_text(size = 5.5, angle = 45, hjust = 1),
+            panel.grid.major = element_line(color = "grey92"),
+            panel.grid.minor = element_blank(),
+            panel.border = element_blank(),
+            plot.background = element_rect(fill = "transparent", color = NA),
+            plot.margin = unit(c(2, 2, 2, 2), "mm"),
+            plot.caption = element_text(size = 5, hjust = 0, margin = margin(t = 4))
+          ) +
+          labs(x = "Feature Pair", y = NULL)
+
+        if (!below_floor) {
+          p <- p + geom_errorbar(
+            aes(ymin = ci_lo_plot, ymax = ci_hi_plot),
+            width = 0.2, linewidth = 0.5, na.rm = TRUE
+          )
+        } else {
+          p <- p + labs(
+            caption = "CI unavailable (oob_count < 50); point estimate shown only."
+          )
+        }
+
+        y_axis_grob <- make_y_grob(y_label, y_sublabel)
+
+        # Save: multiclass uses <id>_interactions_<label>.png; non-multiclass uses <id>_interactions.png
+        safe_id <- str_replace_all(as.character(indiv_id), "[^a-zA-Z0-9_\\-]", "_")
+        if (is_multiclass_int) {
+          safe_cl <- str_replace_all(as.character(cl_val), "[^a-zA-Z0-9_\\-]", "_")
+          fname <- sprintf("%s_interactions_%s.png", safe_id, safe_cl)
+        } else {
+          fname <- sprintf("%s_interactions.png", safe_id)
+        }
+        fpath <- file.path(indiv_plot_dir, fname)
+
+        p_with_axis <- arrangeGrob(p, left = y_axis_grob)
+        ggsave(fpath, p_with_axis, width = 10, height = 5, dpi = 300, bg = "transparent")
+        msgs <- c(msgs, sprintf("Saved: %s", fname))
+      }
+      return(paste(msgs, collapse = "; "))
+    }, error = function(e) {
+      return(sprintf("[ERROR] individual %s: %s", indiv_id, e$message))
+    })
+  }
+
+  if (.Platform$OS.type == "unix") {
+    results_indiv <- parallel::mclapply(ids, plot_one_individual_int, mc.cores = n_cores)
+  } else {
+    results_indiv <- lapply(ids, plot_one_individual_int)
+  }
+
+  for (msg in results_indiv) {
+    cat(sprintf("[INFO] %s\n", msg))
+  }
+  invisible(NULL)
+}
+
+
+# --- Auto-discover and render per-individual plots ---
+indiv_dir <- file.path(RUN_DIR, "indiv_reports")
+if (dir.exists(indiv_dir)) {
+  cat(sprintf("\n[INFO] indiv_reports/ found at %s; rendering per-individual plots.\n", indiv_dir))
+  main_path <- file.path(indiv_dir, "main_effects.parquet")
+  int_path  <- file.path(indiv_dir, "interactions.parquet")
+  if (file.exists(main_path)) {
+    render_indiv_main_effects_plots(main_path, indiv_dir, INDIV_Y_LABEL,
+                                    INDIV_Y_SUBLABEL, NEGATE_SHAP, N_CORES)
+  }
+  if (file.exists(int_path)) {
+    render_indiv_interactions_plots(int_path, indiv_dir, INDIV_Y_LABEL,
+                                    INDIV_Y_SUBLABEL, NEGATE_SHAP, N_CORES)
+  }
+} else {
+  cat("[INFO] No indiv_reports/ directory found; skipping per-individual plots.\n")
+}
+
+cat("\n[INFO] plot.R complete.\n")

@@ -19,6 +19,8 @@ from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 
 from .utils import (
     _normalize_quotes,
+    _label_nominal,
+    _validate_nominal_unseen,
     load_config,
     save_json_atomic,
     detect_task,
@@ -27,6 +29,8 @@ from .utils import (
     get_scoring_function,
     compute_bootstrap_ci,
     compute_permutation_test,
+    _load_sig_GII_from_shap_stats,
+    validate_indiv_reports_config,
 )
 
 from .shap_utils import run_shap_pipeline
@@ -149,9 +153,18 @@ def main():
     nom_feats = [c for c, t in feature_types.items() if t == 'nominal']
 
     # A. Cast Nominals (String -> Category).
-    # NaN -> "__NA__" (literal string level). See train.py and README for rationale.
+    # NaN -> "__NA__" (informative-missing sentinel); unseen level -> "__UNSEEN__" (OOD sentinel).
+    # Levels are read from the training-time nominal codebook in feature_metadata.json.
+    nominal_codebooks = feature_meta.get("nominal_codebooks", {})
     for c in nom_feats:
-        X[c] = df_raw[c].fillna("__NA__").astype(str).astype("category")
+        # Distinguish NaN (informative-missing) from unseen-level (OOD) at predict-time.
+        levels = set(nominal_codebooks.get(c, []))  # training-time codebook for column c
+        if levels:
+            _validate_nominal_unseen(df_raw[c], levels, column_name=c)
+            X[c] = df_raw[c].apply(lambda v: _label_nominal(v, levels)).astype(str).astype("category")
+        else:
+            # Fallback: no codebook persisted (legacy training run); preserve prior behavior
+            X[c] = df_raw[c].astype(object).fillna("__NA__").astype(str).astype("category")
 
     # B. Cast Continuous (Float32)
     for c in con_feats:
@@ -516,9 +529,65 @@ def main():
     # Override run_dir so SHAP outputs go to the inference directory
     shap_ctx["run_dir"] = infer_dir
 
-    run_shap_pipeline(shap_ctx)
+    if config["shap"].get("compute_global_on_inference", False):
+        run_shap_pipeline(shap_ctx)
+        print("[INFO] Global SHAP analysis emitted on inference dataset "
+              "(shap.compute_global_on_inference=true).")
+    else:
+        print("[INFO] Global SHAP analysis on inference dataset skipped "
+              "(shap.compute_global_on_inference=false; default).")
 
-    # 12. Save inference metadata
+    # 12. Per-individual SHAP reports (indiv_reports, inference mode)
+    validate_indiv_reports_config(config)
+
+    nboot_indiv = int(config["shap"]["indiv_ci_nboot"])
+    if nboot_indiv > 0:
+        from .indiv_reports import generate_indiv_reports, _load_bootstrap_cache_or_fail
+
+        # Fail loudly if bootstrap cache absent at train_dir
+        _load_bootstrap_cache_or_fail(train_dir)
+
+        # sig_GII is a property of the trained model; always load from train_dir
+        sig_GII_main, sig_GII_interaction = _load_sig_GII_from_shap_stats(train_dir)
+
+        # Load X_train from train_dir for OOB accounting consistency
+        train_matrix_path = os.path.join(train_dir, "train_matrix.parquet")
+        if not os.path.exists(train_matrix_path):
+            raise FileNotFoundError(
+                f"train_matrix.parquet not found in {train_dir}. "
+                "Run train.py and predict.py before invoking infer.py with indiv_reports."
+            )
+        X_train = pd.read_parquet(train_matrix_path)
+
+        # Construct y_infer for y_target (None if outcomes absent)
+        if has_outcomes:
+            if len(outcome_cols) > 1:
+                y_infer = df_raw[outcome_cols].copy()
+            else:
+                y_infer = df_raw[outcome_cols[0]].copy()
+        else:
+            y_infer = None
+
+        generate_indiv_reports(
+            run_dir=infer_dir,
+            train_dir=train_dir,
+            X_target=X,
+            ids_target=ids,
+            X_train=X_train,
+            y_target=y_infer,
+            task=task,
+            outcome_cols=outcome_cols,
+            nom_feats=nom_feats,
+            config=config,
+            mode="inference",
+            sig_GII_main=sig_GII_main,
+            sig_GII_interaction=sig_GII_interaction,
+        )
+        print(f"[INFO] Inference indiv_reports/ emitted to {infer_dir}.")
+    else:
+        print("[INFO] shap.indiv_ci_nboot=0; skipping per-individual SHAP reports.")
+
+    # 13. Save inference metadata
     metadata = {
         "training_dir": train_dir,
         "data_path": os.path.abspath(data_path),

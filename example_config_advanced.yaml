@@ -64,10 +64,29 @@ modeling:
   # task_type: "regression"
 
   # Optimization metric for TRAINING
-  # Regression options: "RMSE", "MAE", "Huber", "Quantile"
+  # Regression options: "RMSE", "MAE", "Huber:delta=VALUE", "Quantile"
   # Multi-regression option: "MultiRMSE"
   # Binary classification options: "Logloss", "CrossEntropy"
   # Multiclass classification options: "MultiClass", "MultiClassOneVsAll"
+  #
+  # When to use Huber loss (regression / multi_regression only):
+  #   Huber loss replaces L2 (squared) residuals with L1 (absolute) residuals beyond
+  #   a threshold delta, capping the influence of outliers on gradient updates.
+  #   Consider Huber when the outcome is:
+  #     - Zero-inflated (>= 15% zeros)
+  #     - Right-skewed (skewness >= 2.0)
+  #     - Heavy-tailed (excess kurtosis >= 5.0)
+  #   The pipeline emits a WARNING when these conditions are detected.
+  #
+  # MAD-based delta formula (Huber, 1981; Maronna et al., 2006):
+  #   delta = 1.345 * 1.4826 * MAD(y)
+  #   where MAD(y) = median(|y - median(y)|)
+  #     k = 1.345  -> 95% asymptotic relative efficiency at the normal model
+  #     1.4826     -> MAD consistency factor: 1 / Phi^{-1}(3/4)
+  #   Example: if MAD(y) = 2.5, then delta = 1.345 * 1.4826 * 2.5 = 4.985
+  #   CatBoost syntax: "Huber:delta=4.9850"
+  #
+  # See INPUT_SPECIFICATION.md Section 9 for the full derivation.
   loss_function: "RMSE"
 
   tuning:
@@ -130,4 +149,46 @@ shap:
   splines:
     n_knots: 4            # Knots for 1D/2D splines (smoothness)
     degree: 3             # Polynomial degree (3=Cubic)
-    discrete_threshold: 15 # Number of data points within a "spline knot" to treat as continuous (> 15)
+    discrete_threshold: 15  # Must satisfy: discrete_threshold >= n_knots + degree + 2 (Wood 2017 GAM ch. 4)
+
+  # Per-individual SHAP CI and scaling configuration
+  indiv_ci_nboot: 2500
+    # Number of coupled bootstrap iterations for per-individual SHAP CIs. 0 disables the feature.
+    # When enabled, minimum recommended 2500 (inference CIs Efron-tier, training OOB CIs near-Efron).
+    # Peer-review-facing runs: 5000 (both sides Efron-tier). Values below 2500 permitted but produce
+    # training OOB CIs only at Carpenter-Bithell 2000 minimum tier. Per iteration, K fold refits are
+    # performed on a shared bootstrap sample; total refits executed = K x B. Embarrassingly parallel.
+
+  indiv_scaling_mode: "sd"
+    # Scaling mode for per-individual SHAP values in indiv_reports output.
+    # raw = unscaled SHAP values; sd = divide by SD of training outcome (regression only);
+    # custom_value = divide by shap.indiv_scaling_value.
+
+  indiv_scaling_value: 1.0
+    # Divisor used when indiv_scaling_mode=custom_value (e.g., outcome theoretical maximum, MCID,
+    # clinically meaningful anchor). Must be > 0. Ignored when indiv_scaling_mode != custom_value.
+
+  compute_global_on_inference: false
+    # When true, infer.py also emits shap_analysis/ population-level GII on the inference dataset
+    # (distribution-shift diagnostic at large N). Default false because small-N inference sets
+    # produce degenerate GII.
+
+plot:
+  outcome_max: 100.0
+    # Theoretical maximum value of the outcome (used to scale GII magnitudes on plots).
+    # Renamed from the prior outcome_range CLI arg.
+
+  negate_shap: false  # ONLY affects plot.R rendering
+    # If true, SHAP y-axis values are sign-flipped on GII and indiv plots.
+    # Color gradient and x-axis ordering remain anchored to raw signed SHAP.
+
+  gii_y_label: "Global Importance Index (GII)"
+    # Label strings rendered verbatim on plots (no programmatic composition, no individual-ID
+    # substitution, no auto-appended CI annotation). No plot titles are emitted anywhere in
+    # the pipeline.
+
+  gii_y_sublabel: "SHAP-based feature importance"
+
+  indiv_y_label: "SHAP Value (scaled)"
+
+  indiv_y_sublabel: "Per-individual contribution to predicted outcome"

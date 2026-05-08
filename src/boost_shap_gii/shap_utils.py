@@ -175,9 +175,15 @@ def _check_spline_energy_stability_1d(y_raw: np.ndarray, y_spline: np.ndarray) -
     if tv_raw == 0:
         return True if tv_spline < 1e-9 else False
 
-    # Energy conservation: spline total variation must not exceed raw data's.
-    # 1.001 multiplier = floating-point tolerance for scipy splev rounding,
-    # not a smoothing allowance. Fallback: group means.
+    # Energy-gate tolerance: the 0.1% multiplier (1.001) is an empirical balance
+    # margin. Pure machine epsilon for float64 (~2.2e-16), compounded through N
+    # spline-evaluation operations, produces relative errors typically around
+    # 1e-10 to 1e-8 — well below 1e-3. The 0.1% threshold is loose enough to
+    # avoid false fails from splev rounding plus diff/sum cancellation, and tight
+    # enough to catch genuine spline overshoot indicative of basis instability.
+    # This is an empirical heuristic, not a formal numerical analysis result;
+    # see Higham (2002), *Accuracy and Stability of Numerical Algorithms*, ch. 1
+    # for the role of empirical tolerances in numerical software design.
     if tv_spline > (tv_raw * 1.001):
         return False
 
@@ -206,9 +212,15 @@ def _check_spline_energy_stability_2d(x1: np.ndarray, x2: np.ndarray, y_raw: np.
     if tv_raw_total == 0:
         return True if tv_spline_total < 1e-9 else False
 
-    # Energy conservation: spline total variation must not exceed raw data's.
-    # 1.001 multiplier = floating-point tolerance for scipy splev rounding,
-    # not a smoothing allowance. Fallback: group means.
+    # Energy-gate tolerance: the 0.1% multiplier (1.001) is an empirical balance
+    # margin. Pure machine epsilon for float64 (~2.2e-16), compounded through N
+    # spline-evaluation operations, produces relative errors typically around
+    # 1e-10 to 1e-8 — well below 1e-3. The 0.1% threshold is loose enough to
+    # avoid false fails from splev rounding plus diff/sum cancellation, and tight
+    # enough to catch genuine spline overshoot indicative of basis instability.
+    # This is an empirical heuristic, not a formal numerical analysis result;
+    # see Higham (2002), *Accuracy and Stability of Numerical Algorithms*, ch. 1
+    # for the role of empirical tolerances in numerical software design.
     if tv_spline_total > (tv_raw_total * 1.001):
         return False
 
@@ -220,13 +232,17 @@ def calculate_v_group_means_1d(x: np.ndarray, y: np.ndarray) -> float:
     """V = StdDev of Group Means."""
     df_tmp = pd.DataFrame({'x': x, 'y': y})
     signal = df_tmp.groupby('x')['y'].transform('mean').values
-    return np.std(signal)
+    if len(signal) < 2:
+        return np.nan
+    return np.std(signal, ddof=1)
 
 def calculate_v_group_means_2d(x1: np.ndarray, x2: np.ndarray, y: np.ndarray) -> float:
     """V = StdDev of Group Means (Heatmap)."""
     df_tmp = pd.DataFrame({'x1': x1, 'x2': x2, 'y': y})
     signal = df_tmp.groupby(['x1', 'x2'])['y'].transform('mean').values
-    return np.std(signal)
+    if len(signal) < 2:
+        return np.nan
+    return np.std(signal, ddof=1)
 
 # --- B. Continuous Logic (Splines) with Double Guardrails ---
 
@@ -248,7 +264,9 @@ def calculate_v_spline_1d(x: np.ndarray, y: np.ndarray, n_knots: int, degree: in
                 z = np.polyfit(xs, ys, 1)
                 p = np.poly1d(z)
                 signal = p(xs)
-                return np.std(signal)
+                if len(signal) < 2:
+                    return np.nan
+                return np.std(signal, ddof=1)
             else:
                 return 0.0
 
@@ -261,7 +279,9 @@ def calculate_v_spline_1d(x: np.ndarray, y: np.ndarray, n_knots: int, degree: in
         if not _check_spline_energy_stability_1d(ys, signal):
             return calculate_v_group_means_1d(x, y)
 
-        return np.std(signal)
+        if len(signal) < 2:
+            return np.nan
+        return np.std(signal, ddof=1)
     except Exception:
         return np.nan  # NaN distinguishes "spline failure" from "genuinely zero V"
 
@@ -300,7 +320,9 @@ def calculate_v_spline_2d(x1: np.ndarray, x2: np.ndarray, y: np.ndarray, n_knots
         if not _check_spline_energy_stability_2d(x1, x2, y, signal):
             return calculate_v_group_means_2d(x1, x2, y)
 
-        return np.std(signal)
+        if len(signal) < 2:
+            return np.nan
+        return np.std(signal, ddof=1)
     except Exception:
         return np.nan  # NaN distinguishes "spline failure" from "genuinely zero V"
 
@@ -357,7 +379,10 @@ def calculate_v_stacked_spline(x_cont: np.ndarray, x_disc: np.ndarray, y: np.nda
         except Exception:
             df.loc[mask, 'signal'] = np.mean(ys)
 
-    return np.std(df['signal'].values)
+    signal = df['signal'].values
+    if len(signal) < 2:
+        return np.nan
+    return np.std(signal, ddof=1)
 
 # -----------------------------------------------------------------------------
 # 3. Core SHAP Computation
@@ -471,13 +496,26 @@ def _bootstrap_worker_chunk(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute M, V, and GII for a chunk of bootstrap iterations.
 
-    For each bootstrap resample:
-      - M (Magnitude) = mean(|SHAP|) across observations
-      - V (Variability) = std(signal), where signal is the fitted trend
-        of SHAP values as a function of feature values (spline for continuous,
-        group means for discrete)
-      - GII (Global Importance Index) = sqrt(M * V), the geometric mean
-        of magnitude and variability
+    GII = sqrt(M * V) is structured as a geometric mean of two utility
+    components:
+
+        M (magnitude utility): mean(|SHAP|) across bootstrap resamples,
+            capturing average prediction-contribution magnitude.
+        V (trend-informativeness utility): standard deviation of the systematic
+            SHAP signal (spline-fitted or group-mean-fitted) as a function of
+            feature values; conceptually anchored to Hill (1910) dose-response
+            framing and visualized via Goldstein et al. (2015) ICE plots.
+
+    The geometric-mean form requires both utilities to be meaningfully positive
+    for a feature to be globally important: high M with V ~ 0 yields GII ~ 0
+    (strong magnitude, no dose-response — captured separately by sig_M), and
+    vice versa. This decision-theoretic framing avoids inflating the importance
+    of features with large attribution magnitudes but no feature-value-driven
+    prediction variation.
+
+    References:
+        Hill (1910), J. Physiol., 40: i-vii.
+        Goldstein et al. (2015), J. Comput. Graph. Stat., 24: 44-65.
 
     Returns (chunk_mag, chunk_var, chunk_gii), each shaped (n_iter, n_effects).
     """
@@ -898,6 +936,26 @@ def _run_bootstrap_pipeline(
     # input p-value is NaN. Mask NaN→1.0 (conservative: "not significant"), run
     # correction, then restore NaN for affected positions.
     def _nan_safe_fdr(p_vals, alpha_val):
+        """Apply BH-FDR correction to a pooled p-value vector with NaN pass-through.
+
+        Applied to the pooled set of all effects (singletons + interactions across
+        all noise strata). NaN p-values (from failed calculations) are excluded from
+        the BH denominator and restored as NaN q-values after correction.
+        No cross-family correction is applied between sig_M, sig_V, and sig_GII;
+        each family receives an independent BH call.
+
+        Parameters
+        ----------
+        p_vals : np.ndarray
+            Pooled p-value vector across all real effects (all types, all strata).
+        alpha_val : float
+            FDR threshold (passed to multipletests).
+
+        Returns
+        -------
+        np.ndarray
+            BH-adjusted q-values; NaN where p_vals was NaN.
+        """
         nan_mask_p = np.isnan(p_vals)
         if nan_mask_p.any():
             p_clean = p_vals.copy()
@@ -907,6 +965,10 @@ def _run_bootstrap_pipeline(
             return q_vals
         return multipletests(p_vals, alpha=alpha_val, method='fdr_bh')[1]
 
+    # Three independent BH-FDR calls — one per family (sig_M, sig_V, sig_GII).
+    # Each call receives the FULL pooled p-value vector across ALL real effects
+    # (singletons + interactions, all noise strata). No cross-family joint
+    # correction is applied; effect-row ordering matches effect_names throughout.
     q_exceed_m = _nan_safe_fdr(p_exceed_m, alpha)
     q_exceed_v = _nan_safe_fdr(p_exceed_v, alpha)
     q_exceed_gii = _nan_safe_fdr(p_exceed_gii, alpha)

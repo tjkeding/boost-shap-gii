@@ -47,7 +47,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 
 3. **Implement (Plan + Build)** -- Implementation proceeded in two sub-phases: (a) a technical specification mapping each approved change to specific code modifications with risk assessment, and (b) execution of the specification. All plans required human approval before code generation began.
 
-4. **Test** -- Comprehensive test suite development (385 tests across 14 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
+4. **Test** -- Comprehensive test suite development (625 tests across 17 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
 
 5. **Clean** -- Code quality review for consistency, style, and maintainability.
 
@@ -56,7 +56,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 Key properties of this workflow:
 
 - All decisions required **explicit human approval** before implementation.
-- The pipeline was developed with a **test-first** approach; 385 tests validate statistical correctness, edge-case handling, and integration behavior.
+- The pipeline was developed with a **test-first** approach; 625 tests validate statistical correctness, edge-case handling, and integration behavior.
 - Every statistical and algorithmic choice was subjected to **formal critical review**, with findings documented and triaged individually.
 
 ## 5. Human Oversight
@@ -89,12 +89,167 @@ The project-level configuration file used to guide AI interactions is preserved 
 
 Raw session transcripts are excluded for privacy reasons. The structured reports above capture all substantive technical decisions, rationale, and implementation details.
 
-## 7. References
+## 7. Development Session Log
+
+### Session 2026-04-24 -- indiv_reports feature and A1 patch (bundled Option B release)
+
+**Date:** 2026-04-24
+
+**Session scope:**
+
+- New module `src/boost_shap_gii/indiv_reports.py`: per-individual SHAP reports with coupled-bootstrap confidence intervals (CIs). Implements Option E with a shared bootstrap sample per iteration across all K fold refits, producing estimand-matched CIs for both training individuals (OOF single-model SHAP) and inference individuals (ensemble-mean SHAP).
+- Bundled A1 patch (pandas-3.0 Categorical `fillna` compatibility): applied to `train.py`, `predict.py`, and `infer.py`; 19 regression tests added (`tests/test_categorical_fillna_bugfix.py`).
+- Config schema additions: six new `shap.*` keys (`indiv_ci_nboot`, `indiv_scaling_mode`, `indiv_scaling_value`, `compute_global_on_inference`) and six new `plot.*` keys (`outcome_max`, `negate_shap`, `gii_y_label`, `gii_y_sublabel`, `indiv_y_label`, `indiv_y_sublabel`).
+- New training artifact: `train_outcome_stats.json` (written unconditionally by `train.py` for regression tasks; empty stats dict for classification tasks).
+- `predict.py` update: orchestrates bootstrap-refit cache and invokes `generate_indiv_reports` for training-mode individual reports.
+- `infer.py` update: invokes `generate_indiv_reports` for inference-mode individual reports; default behavior change (see Breaking Changes).
+- `plot.R` extension: per-individual dot-plus-whisker plot rendering with signed-rank x-ordering; CLI simplified to CONFIG_PATH + optional RUN_DIR (positional args 2-4 removed).
+- `check_env.py` / `cli.py`: environment preflight (`run_preflight()`) elevated to a mandatory gate called at every CLI entry point.
+- Documentation updates: `INPUT_SPECIFICATION.md` Section 10 (per-individual reports), `README.md` usage notes, `AID_LOG.md` (this entry).
+
+**LLM tools used:**
+
+- Claude Opus 4.7 (Anthropic): orchestrator role -- brainstorm sessions, implementation plan authoring, algorithmic design review, plan-discipline verification.
+- Claude Sonnet 4.6 (Anthropic): build-agent role -- code generation, config edits, documentation drafting, file management.
+
+No LLM was granted co-authorship or scientific credit. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
+
+**Key algorithmic decisions (researcher-approved):**
+
+- *Option E coupled bootstrap:* per iteration b, one shared bootstrap sample s_b is drawn from the full training set; all K fold refits for iteration b use s_b. This binds fold refits per iteration so that ensemble replicates capture between-fold covariance correctly.
+- *Estimand-matched point and CI:* the point estimate for each individual is the deployed-product SHAP (OOF single-model for training individuals assigned to fold k_i; ensemble-mean across K models for inference individuals). Bootstrap refits are consumed only for CI bounds, not for the point estimate, preventing the systematic point-outside-CI risk that arises when single-model variance is applied to an ensemble estimator.
+- *OOB floor = 50:* training individuals whose OOB count is below 50 emit NaN CI bounds with `oob_count` preserved in the output schema. Below-floor plots render point estimates only with an in-plot caption.
+- *Minimum recommended B = 2500; peer-review runs B = 5000:* at B = 2500 and K = 10, inference CIs are Efron-tier (B >= 1000 effective); training OOB CIs are near-Efron (approximately 0.368 x 2500 = 920 effective). At B = 5000, both sides clear the Efron threshold (Efron & Tibshirani, 1993).
+- *Fold-assignment reconstruction:* training-individual fold assignments are reconstructed deterministically at predict-time via `get_cv_splitter(config, y_for_split)` (matching `predict.py`'s existing reconstruction pattern) rather than persisted as a new artifact by `train.py`.
+- *Path-dependent SHAP retained:* raw path-dependent SHAP interactions are used for the individual interaction reports, consistent with the global GII computation in `shap_utils.py`.
+- *Per-individual inspection framing:* the feature is framed as a hypothesis-generating tool for individual-level SHAP inspection, not a diagnostic or prescriptive output.
+- *Three-mode scaling:* `raw` (unscaled), `sd` (divide by training-outcome SD from `train_outcome_stats.json`; regression only), `custom_value` (user-supplied divisor; any task type).
+- *Dot-plus-whisker plot format with signed-rank x-ordering:* per-individual plots render features ordered by signed SHAP value, with whisker extent encoding the bootstrap CI range.
+
+**Test metrics:**
+
+- Pre-session: 461 tests across 16 test files (458 passing; 3 failing on missing `nanoparquet` R package, environment-only).
+- Post-build target (before /test phase): 461 + tests for `indiv_reports.py` and supporting changes. Exact post-test count populated in end-session report after /test phase completes.
+
+**Breaking changes:**
+
+1. `infer.py` no longer emits population-level `shap_analysis/` by default. Users who require global SHAP on inference data must set `shap.compute_global_on_inference: true` in their config. Rationale: global GII on small inference sets produces degenerate results; opt-in is safer than opt-out.
+2. `plot.R` CLI simplified: positional args 2-4 (`OUTCOME_RANGE`, `NEGATE_SHAP`, `Y_AXIS_LABEL`) removed. These values are now read from the config file. Users invoking `plot.R` directly with the old 4-arg signature will see a fail-loud error from the script's argument-count check.
+3. All configs must include the six new `shap.*` keys and six new `plot.*` keys. Existing configs without them will fail `validate_indiv_reports_config()` / `validate_plot_config()` with precise error messages (err-on-kill per project philosophy).
+
+**Audit trail references (.aid/reports/):**
+
+- Brainstorm: `boost-shap-gii_brainstorm_20260423_191951.md` (10 topics locked; 5 decisions deferred; Decision 5 HP-source lock = Option E)
+- Implementation plan: `boost-shap-gii_implement_plan_20260424_084001.md` (12 changes, 15 plan-discipline resolutions)
+- Implementation build reports: `boost-shap-gii_implement_build_20260424_*.md` (one per agent dispatch group)
+
+---
+
+### Session 2026-05-07 -- CR-remediation cycle (critical review + remediation implementation)
+
+**Date:** 2026-05-07
+
+**Session scope:**
+
+- Full independent critical review (CR) of the entire pipeline. 25 findings produced (5 critical, 9 major, 8 minor, 3 note); overall assessment: needs_revision; publication release blocked pending closure of the critical findings.
+- CR-remediation implementation: 18 discrete changes (reviewed and approved by the researcher) were applied across the pipeline codebase to address all 25 CR findings. Key methodological changes include:
+  - *GII decision-theoretic framing*: the GII formula is documented as a geometric mean of two utility components: M (magnitude) and V (variability). A feature must score positively on BOTH dimensions for the geometric mean to be nonzero, preventing high-magnitude features with no dose-response variation from reaching significance. The V component is anchored conceptually to Hill (1910) dose-response theory and visualized via individual conditional expectation curves (Goldstein et al., 2015). README.md and INPUT_SPECIFICATION.md updated; `shap_utils.py` docstrings updated.
+  - *V-component sample standard deviation*: all six V-computation sites in `shap_utils.py` converted from population SD (ddof=0) to sample SD (ddof=1; Fisher, 1925) for unbiased variance estimation. Len < 2 guard added at each site (returns NaN for degenerate resamples).
+  - *Shadow model leakage closure*: Phase 2 shadow model training removed `eval_set` and `early_stopping_rounds` (Kursa & Rudnicki, 2010). Prior implementation allowed shadow-model iteration-count selection to be influenced by validation outcomes, biasing the noise calibration baseline. Fixed iteration count `tuned_iters * 2` is retained without early stopping.
+  - *Three independent BH-FDR calls*: exceedance p-values for M, V, and GII now each receive an independent Benjamini-Hochberg FDR correction (Benjamini & Hochberg, 1995). Prior implementation pooled all three into a single FDR call, inflating false discovery rate when the three families are differentially powered.
+  - *Degenerate bootstrap CI fallback*: `compute_bootstrap_ci` returns `(base_score, NaN, NaN)` with a `RuntimeWarning` when `n_boot_effective = 0` (all bootstrap iterations dropped). Prior implementation returned `(base_score, base_score, base_score)`, which could be mistaken for a valid zero-width CI.
+  - *Two-tier nominal unseen validation*: `_validate_nominal_unseen` added to `utils.py`. Tier 1 raises `ValueError` when > 50% of unique unseen values are absent from the nominal codebook (systematic naming mismatch). Tier 2 emits `UserWarning` when > 10% of observations encounter unseen levels (data quality issue).
+- New test file `tests/test_build_20260507.py` (30 tests across 8 classes) covering seven previously unexercised code paths from the remediation cycle.
+- Post-remediation test suite: 625 tests across 17 test files; 624 passing (1 skipped — conditional on optional `psutil` dependency), 0 failing.
+
+**LLM tools used:**
+
+- Claude Opus 4.7 (Anthropic): orchestrator role -- critical review, brainstorm sessions, implementation plan authoring, disposition adjudication.
+- Claude Sonnet 4.6 (Anthropic): build-agent role -- code generation, test implementation, documentation edits, file management.
+
+No LLM was granted co-authorship or scientific credit. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
+
+**Key algorithmic decisions (researcher-approved):**
+
+- *GII as a geometric-mean composite*: the geometric-mean structure requires both M and V to be meaningfully positive. This decision-theoretic framing was approved by the researcher as the canonical formulation and is now reflected in README.md, INPUT_SPECIFICATION.md Section 3, and `shap_utils.py` docstrings.
+- *BH-FDR with three independent families*: pooled FDR was identified as a critical finding. The researcher approved separation into three independent BH calls (one per component family) to prevent cross-family FDR inflation.
+- *Shadow leakage closure*: the researcher approved removing `eval_set` from the Phase 2 shadow model. The doubled-ceiling fixed-iteration approach is retained as the iteration budget.
+- *Backwards-compatibility shim retention*: a `nominal_codebooks`-absent fallback in `predict.py` and `infer.py` (for models trained before this release) was explicitly reviewed and approved by the researcher. The shim is a narrow compatibility layer, not a behavioral default.
+
+**Test metrics:**
+
+- Pre-remediation: 461 tests across 16 test files (458 passing; 3 failing on missing `nanoparquet` R package, environment-only).
+- Post-remediation: 625 tests across 17 test files; 624 passing, 1 skipped (psutil conditional), 0 failing.
+
+**Audit trail references (.aid/reports/):**
+
+- Critical review: `boost-shap-gii_cr_20260424_192405.md` (25 findings with severity classifications and researcher triage decisions)
+- Implementation plan: `boost-shap-gii_implement_plan_20260507_104713.md` (18-change technical specification)
+- Implementation build report: `boost-shap-gii_implement_build_20260507_124302.md`
+- Test reports: `boost-shap-gii_test_20260507_130304.md`, `boost-shap-gii_test_20260508_090928.md`
+
+---
+
+## 8. Version and Release Notes
+
+### Version 1.2.0 -- 2026-05-08 (CR-remediation release)
+
+This release encompasses the critical review (CR) remediation cycle completed 2026-05-07. All 25 CR findings are resolved in code.
+
+- **GII decision-theoretic framing**: GII documented as a geometric mean of M and V. README.md, INPUT_SPECIFICATION.md, and `shap_utils.py` docstrings updated.
+- **V-component sample SD (ddof=1)**: all six V-computation sites in `shap_utils.py` corrected from population SD to sample SD; len < 2 NaN guard added.
+- **Shadow model leakage closure**: `eval_set` and `early_stopping_rounds` removed from Phase 2 shadow model training.
+- **Three independent BH-FDR calls**: one per component family (M, V, GII) for exceedance p-value correction.
+- **Degenerate CI fallback**: `compute_bootstrap_ci` returns `(base_score, NaN, NaN)` with `RuntimeWarning` when no bootstrap iterations are valid.
+- **Two-tier nominal unseen validation**: Tier 1 `ValueError` (> 50% unique-value mismatch) and Tier 2 `UserWarning` (> 10% observation-level mismatch).
+- **Adaptive-knot LSQ spline parity**: `plot.R` V-spline computation aligned with Python `LSQUnivariateSpline` (splines::splineDesign + qr.solve).
+- **Nominal top-5 selection by V-contribution**: `plot.R` selects top nominal levels by V-contribution rank (count_k * (mean_SHAP_k - grand_mean)^2) rather than frequency.
+- **Documentation**: INPUT_SPECIFICATION.md Sections 3, 4, and 8 updated; README.md CLI interface corrected; per-individual reports relocated to a dedicated subsection.
+- **Breaking changes**: none beyond those introduced in v1.1.0 (see v1.1.0 entry).
+
+---
+
+### Version 1.1.0 -- 2026-04-24 (bundled Option B release)
+
+This release bundles all uncommitted work from Session 2026-04-23 onward into a single tagged release:
+
+- **A1 patch (pandas-3.0 Categorical fillna compatibility):** `train.py`, `predict.py`, `infer.py` patched; 19 regression tests added.
+- **indiv_reports feature:** new module `src/boost_shap_gii/indiv_reports.py` providing per-individual SHAP reports with coupled-bootstrap CIs; `predict.py` and `infer.py` updated as consumers; `plot.R` extended with per-individual plots.
+- **Config schema extensions:** six `shap.*` keys, six `plot.*` keys; `train_outcome_stats.json` new artifact.
+- **Environment preflight hardening:** `run_preflight()` called at every CLI entry point.
+- **Documentation:** `INPUT_SPECIFICATION.md` Section 10 added; `README.md` updated; `AID_LOG.md` updated (this entry).
+- **Breaking changes:** `infer.py` default SHAP behavior change; `plot.R` CLI surface simplified; all configs require new required keys.
+
+---
+
+## 9. References
+
+- Benjamini, Y., & Hochberg, Y. (1995). Controlling the false discovery rate: a practical and powerful approach to multiple testing. *Journal of the Royal Statistical Society: Series B*, 57(1), 289-300.
+
+- Breiman, L. (2001). Random forests. *Machine Learning*, 45(1), 5-32.
 
 - Bridgeford, E. W., et al. (2025). Ten simple rules for AI-assisted coding in science. *arXiv preprint*, arXiv:2510.22254.
 
+- Carpenter, J., & Bithell, J. (2000). Bootstrap confidence intervals: when, which, what? A practical guide for medical statisticians. *Statistics in Medicine*, 19(9), 1141-1164.
+
+- Davison, A. C., & Hinkley, D. V. (1997). *Bootstrap Methods and Their Application*. Cambridge University Press.
+
+- Efron, B. (1983). Estimating the error rate of a prediction rule: improvement on cross-validation. *Journal of the American Statistical Association*, 78(382), 316-331.
+
+- Efron, B., & Tibshirani, R. J. (1993). *An Introduction to the Bootstrap*. Chapman and Hall/CRC.
+
+- Fisher, R. A. (1925). *Statistical Methods for Research Workers*. Oliver and Boyd.
+
+- Goldstein, A., Kapelner, A., Bleich, J., & Pitkin, E. (2015). Peeking inside the black box: Visualizing statistical learning with plots of individual conditional expectation. *Journal of Computational and Graphical Statistics*, 24(1), 44-65.
+
+- Hill, A. V. (1910). The possible effects of the aggregation of the molecules of haemoglobin on its dissociation curves. *Journal of Physiology*, 40, iv-vii.
+
 - Jamieson, A. J., et al. (2024). Protecting scientific integrity in an age of generative AI. *Proceedings of the National Academy of Sciences*, 121(41), e2407886121.
 
+- Kursa, M. B., & Rudnicki, W. R. (2010). Feature selection with the Boruta package. *Journal of Statistical Software*, 36(11), 1-13.
+
 - Nussberger, A.-M., et al. (2024). Ten simple rules for using large language models in science. *PLOS Computational Biology*, 20(7), e1012291.
+
+- Prokhorenkova, L., Gusev, G., Vorobev, A., Dorogush, A. V., & Gulin, A. (2018). CatBoost: unbiased boosting with categorical features. *Advances in Neural Information Processing Systems*, 31, 6638-6648.
 
 - Weaver, J. B. (2025). The AI Disclosure (AID) Framework. *arXiv preprint*, arXiv:2408.01904v2.
