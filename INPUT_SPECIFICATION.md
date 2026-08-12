@@ -120,8 +120,12 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
 - No outer early stopping: iteration count set by inner CV mean `best_iteration_`.
 
 **Phase 2 — Shadow Model (Noise Calibration)**:
-- Shadow features: each column independently permuted (column-wise, not row-wise).
-  Permutation seed: `random_seed + fold_idx`.
+- Shadow features: column-wise permutation with seed `random_seed + fold_idx`. When
+  `aggregate_shap` is configured, grouped features receive block-permutation (shared
+  permutation index per group, preserving within-group correlation; Au et al. 2022, S1);
+  ungrouped features are permuted independently. When `aggregate_shap` is absent, all
+  columns are permuted independently (equivalent to the block-permutation path with an
+  empty group map).
 - Shadow model trained on concatenated real + shadow features (2p total).
 - Fixed iteration count: `tuned_iters * 2` (no `eval_set`, no early stopping). The doubled
   ceiling compensates for the expanded feature space (2p vs. p), consistent with Kursa &
@@ -247,6 +251,43 @@ See Section 10 for the full per-individual CI algorithm, output schema, and inte
 | `degree` | int | `3` | Polynomial degree (3 = cubic). Downgraded automatically when too few knots. |
 | `discrete_threshold` | int | `15` | Features with ≤ this many unique values per resample are treated as discrete (group means instead of spline). |
 
+#### `aggregate_shap`
+
+Top-level config block (sibling of `shap`, not nested under it). Defines user-specified feature
+groups for post-hoc group-level SHAP analysis. When absent or empty, all features are analyzed
+individually (default behavior). When present, both individual-feature and group-level effects
+appear in the output.
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `<group_name>` | list[str] | Yes (per group) | List of constituent feature column names. Group name becomes the effect name in `shap_stats_global.csv`. |
+
+**Constraints** (enforced at training time by `_validate_aggregate_shap()`):
+
+| Rule | Error Type | Description |
+|---|---|---|
+| No name collision | `ValueError` | Group name must not match any resolved feature column name. |
+| Non-empty membership | `ValueError` | Each group must list at least one constituent feature. |
+| Exists in feature set | `ValueError` | Every constituent must exist in the resolved feature set (after all-missing column drops). |
+| No nominal features | `ValueError` | Nominal (categorical) features are prohibited; SHAP values for categorical features are not directly comparable across levels. |
+| Disjoint membership | `ValueError` | A feature may appear in at most one group across all defined groups. |
+| Single-member advisory | `WARNING` | Single-member groups emit a warning (no aggregation benefit). |
+
+**Example**:
+```yaml
+aggregate_shap:
+  subscale_A_total:
+    - "subscale_A_item1"
+    - "subscale_A_item2"
+    - "subscale_A_item3"
+  subscale_B_total:
+    - "subscale_B_item1"
+    - "subscale_B_item2"
+```
+
+See Section 4 (SHAP Decomposition Details) for the full aggregation algorithm, shadow block-permutation
+strategy, and output effect naming conventions.
+
 #### `plot`
 
 All `plot.*` keys are consumed exclusively by the `plot` subcommand (`plot.R` via `boost-shap-gii plot`). They are not referenced by `train`, `predict`, or `infer`. All six keys below are required when the `plot` subcommand is invoked; missing keys cause a loud failure before any plot is generated.
@@ -341,6 +382,57 @@ to interpret M and V significance separately from GII significance.
   singleton_ordinal, singleton_nominal, interaction_continuous_continuous, etc.). Per-stratum
   maximum shadow GII is used as the noise threshold, preventing inflation from cross-type
   scale differences.
+
+#### Aggregate SHAP (Group-Level Decomposition)
+
+When the `aggregate_shap` config block is present, the pipeline computes group-level effects
+after individual-feature SHAP values have been extracted and flattened but before the bootstrap
+pipeline runs. Both individual-feature and group-level effects appear in the final output;
+aggregation augments, it does not replace.
+
+**Aggregation operator**: SHAP values are summed across group members. This is justified by the
+SHAP additivity property: the contribution of a set of features equals the sum of their
+individual SHAP values when interaction effects within the set are also accounted for
+(Lundberg & Lee, 2017). The pipeline explicitly sums both singletons and within-group
+interactions, ensuring that the group aggregate captures the full attributable contribution.
+
+**Effect types produced per group** (for a group G with members {f1, f2, ..., fp}):
+
+| Effect | Name in output | SHAP computation | Type |
+|---|---|---|---|
+| Singleton aggregate | `G` | sum of Phi[fi,fi] for all fi in G | Singleton |
+| Within-group interaction | `G x G` | sum of (Phi[fi,fj] + Phi[fj,fi]) for all fi,fj pairs in G | Interaction |
+| Between-group interaction | `G1 x G2` | sum of (Phi[fi,gj] + Phi[gj,fi]) for all fi in G1, gj in G2 | Interaction |
+| Group-by-ungrouped interaction | `G x u` (alphabetically sorted) | sum of (Phi[fi,u] + Phi[u,fi]) for all fi in G | Interaction |
+
+**Feature-value axis for V-component**: Each group is assigned a synthetic feature-value column
+equal to the sum of its members' feature values (`X_stacked[group_name] = sum(X[members])`).
+This summed score is registered as type `continuous` in the feature-type map, meaning the
+V-component for group-level effects uses the spline-based trend estimator (not group means).
+
+**Shadow block-permutation** (Au et al. 2022, S1): When `aggregate_shap` is configured, shadow
+feature generation switches from independent column-wise permutation to block-permutation.
+Within each defined group, all member features share a single permutation index (drawn from
+`rng.permutation(n)`), preserving the within-group correlation structure in the shadow copy.
+Features not in any group are still permuted independently. This ensures that the shadow noise
+distribution for aggregate effects reflects the group's correlation structure rather than
+the artificially decorrelated structure that independent permutation would produce. Without
+block-permutation, shadow aggregate SHAP values would be systematically lower than the true
+null, inflating Type I error for group-level significance tests.
+
+The block-permutation is implemented in `utils._block_permute_shadow()` and applied in both
+`train.py` (training fold shadow generation) and `shap_utils.py` (inference-mode shadow
+generation). The same RNG seed convention applies: `random_seed + fold_idx` for training,
+`random_seed + fold_idx + 1000` for inference-mode per-fold shadows.
+
+**Interaction with individual-feature effects**: Group-level effects coexist with the
+individual-feature effects in `shap_stats_global.csv`. The constituent features (f1, f2, ...)
+and their pairwise interactions remain in the output alongside the group aggregates. The
+`is_aggregate` column distinguishes group-level rows (`True`) from native individual-feature
+rows (`False`). Users who configure `aggregate_shap` should be aware that the results table
+grows by the number of aggregate effects (approximately: G singletons + G*(G-1)/2
+between-group interactions + G within-group interactions + G*U group-by-ungrouped interactions,
+where G is the number of groups and U is the number of ungrouped features).
 
 #### V-Component Method Selection
 Per bootstrap resample, the SHAP-vs-feature trend is estimated by:
@@ -509,6 +601,7 @@ output_dir/<subdir>/
 | `V`, `V_ci_*`, `p_exceed_V`, `q_exceed_V`, `stab_pctl_V`, `sig_V` | float/bool | Same columns for the V component. |
 | `calc_failed` | bool | `True` if any point estimate (M, V, or GII) is NaN. |
 | `v_failure_rate` | float | Fraction of bootstrap iterations where V spline fitting raised an exception (NaN result). High rates (> 0.05) indicate unreliable V estimates. |
+| `is_aggregate` | bool | `True` when the effect is or involves an aggregate group defined via `aggregate_shap`. `False` for all native individual-feature effects and when `aggregate_shap` is absent or empty. |
 
 ---
 
@@ -550,6 +643,26 @@ trigger the two-tier validation (see Stage 3). `NaN` in ordinal features becomes
   rescaling, because percent-of-max rescaling on z-scaled SHAP would produce a unit
   mismatch. Plot y-axis units for multi_regression are therefore "SHAP value (z-scaled)"
   rather than "% of outcome_max."
+
+- **Aggregate SHAP group size**: Very large groups (e.g., 50+ members) may produce aggregate
+  SHAP values with high V estimates driven by the summed feature-value axis spanning a wide
+  range, rather than by meaningful dose-response structure. The stability gate (`stab_thresh`)
+  provides the primary protection, but users should verify that group-level V estimates reflect
+  genuine dose-response patterns and not artifacts of the summed scale.
+
+- **Aggregate SHAP and individual-feature redundancy**: When `aggregate_shap` is configured,
+  the results table contains both individual-feature effects and group-level aggregate effects.
+  These are not independent: the aggregate singleton is the sum of member singletons. Users
+  should not treat aggregate and member significance as independent statistical evidence. The
+  aggregate is a convenience summary; the member-level effects remain the primary
+  decomposition.
+
+- **Block-permutation and group correlation**: The block-permutation strategy preserves
+  within-group correlation in shadow features. If the configured group members are empirically
+  uncorrelated, block-permutation is slightly conservative relative to independent permutation
+  (the shadow null is wider than necessary). This is by design: the conservative direction is
+  preferred because the alternative (independent permutation for correlated features) produces
+  anti-conservative group-level tests.
 
 - **CatBoost multi-thread bitwise determinism**: CatBoost (Prokhorenkova et al. 2018)
   does not provide a multi-thread bitwise-determinism flag (unlike LightGBM's

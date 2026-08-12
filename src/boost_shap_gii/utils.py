@@ -36,6 +36,58 @@ def _normalize_quotes(s):
     return s.replace('\u2018', "'").replace('\u2019', "'").replace('\u201C', '"').replace('\u201D', '"')
 
 
+def _block_permute_shadow(
+    df: pd.DataFrame,
+    agg_groups: Dict[str, List[str]],
+    rng: np.random.Generator,
+) -> pd.DataFrame:
+    """Apply block-permutation for shadow generation (Au et al. 2022, S1).
+
+    Grouped features receive a shared row-permutation index per group,
+    preserving within-group correlation. Ungrouped features are permuted
+    independently. Category dtypes are preserved through permutation.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame to permute in place (caller should pass a copy).
+    agg_groups : dict
+        Mapping {group_name: [member_col, ...]} from config["aggregate_shap"].
+        Empty dict is valid (all columns permuted independently).
+    rng : np.random.Generator
+        Initialized random generator.
+
+    Returns
+    -------
+    pd.DataFrame
+        The same DataFrame, permuted in place.
+    """
+    grouped_features: set = set()
+    for members in agg_groups.values():
+        grouped_features.update(members)
+
+    for _group_name, members in agg_groups.items():
+        n = len(df)
+        perm_idx = rng.permutation(n)
+        for c in members:
+            if c not in df.columns:
+                continue
+            orig_dtype = df[c].dtype
+            df[c] = df[c].values[perm_idx]
+            if orig_dtype.name == 'category':
+                df[c] = df[c].astype(orig_dtype)
+
+    for c in df.columns:
+        if c in grouped_features:
+            continue
+        orig_dtype = df[c].dtype
+        df[c] = rng.permutation(df[c].values)
+        if orig_dtype.name == 'category':
+            df[c] = df[c].astype(orig_dtype)
+
+    return df
+
+
 def load_config(path: str) -> Dict[str, Any]:
     """Load and parse YAML configuration without defaults."""
     with open(path, "r") as f:

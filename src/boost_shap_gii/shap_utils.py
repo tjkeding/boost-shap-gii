@@ -58,7 +58,7 @@ from scipy import stats
 from statsmodels.stats.multitest import multipletests
 from joblib import Parallel, delayed
 
-from .utils import get_cv_splitter, detect_task, is_regression
+from .utils import get_cv_splitter, detect_task, is_regression, _block_permute_shadow
 
 # -----------------------------------------------------------------------------
 # 1. IO & Helpers
@@ -118,6 +118,26 @@ def _to_numeric_matrix(df: pd.DataFrame) -> np.ndarray:
             df_num[col] = df_num[col].fillna(0.0)
 
     return df_num.values
+
+def _is_aggregate_effect(effect_name: str, config: Dict[str, Any]) -> bool:
+    """Return True if effect_name is or involves an aggregate group defined in config.
+
+    An effect is aggregate if its name matches a group name exactly (singleton
+    aggregate) or if either side of an interaction name matches a group name.
+    Returns False when aggregate_shap is absent or empty.
+    """
+    agg_groups = config.get("aggregate_shap", {})
+    if not agg_groups:
+        return False
+    group_names = set(agg_groups.keys())
+    if effect_name in group_names:
+        return True
+    if " x " in effect_name:
+        parts = effect_name.split(" x ")
+        if parts[0] in group_names or parts[1] in group_names:
+            return True
+    return False
+
 
 def _get_effect_stratum(effect_name: str, effect_type: str, feature_types: Dict[str, str]) -> str:
     """
@@ -479,6 +499,213 @@ def _flatten_interaction_matrix(
     df_flat = pd.DataFrame(data)
     return df_flat, metadata
 
+
+def _aggregate_effects(
+    df_shap_real: pd.DataFrame,
+    df_shap_shadow: pd.DataFrame,
+    X_stacked: pd.DataFrame,
+    config: Dict[str, Any],
+    meta_real: Dict[str, Tuple[Tuple[int, int], str]],
+    meta_shadow: Dict[str, Tuple[Tuple[int, int], str]],
+    feature_types: Dict[str, str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
+           Dict[str, Tuple[Tuple[int, int], str]],
+           Dict[str, Tuple[Tuple[int, int], str]],
+           Dict[str, str]]:
+    """Aggregate SHAP effects according to the aggregate_shap config block.
+
+    For each configured group, computes:
+      - A singleton aggregate column (sum of member singleton SHAP values).
+      - A within-group interaction aggregate (sum of member x member interactions).
+      - Between-group interaction aggregates (sum of fi x gj cross-group pairs).
+      - Group x ungrouped interaction aggregates (sum of fi x u pairs).
+
+    Shadow equivalents are computed in parallel using the shadow_ prefix convention.
+    Group-total X columns are registered as sum of member feature values.
+    When aggregate_shap is absent or empty, all inputs are returned unchanged.
+
+    Parameters
+    ----------
+    df_shap_real : pd.DataFrame
+        Real SHAP effect matrix (N rows, effect columns).
+    df_shap_shadow : pd.DataFrame
+        Shadow SHAP effect matrix (N rows, shadow effect columns).
+    X_stacked : pd.DataFrame
+        Stacked feature matrix (real + shadow columns).
+    config : dict
+        Full pipeline config; reads config["aggregate_shap"].
+    meta_real : dict
+        Metadata mapping real effect name -> ((col_i, col_j), type_str).
+    meta_shadow : dict
+        Metadata mapping shadow effect name -> ((col_i, col_j), type_str).
+    feature_types : dict
+        Feature type map {name: type_str}; updated in-place for group totals.
+
+    Returns
+    -------
+    Tuple of (df_shap_real, df_shap_shadow, X_stacked,
+              meta_real, meta_shadow, feature_types), all augmented.
+    """
+    agg_cfg = config.get("aggregate_shap", {})
+    if not agg_cfg:
+        return df_shap_real, df_shap_shadow, X_stacked, meta_real, meta_shadow, feature_types
+
+    # Identify singleton real effects (Singleton type, not shadow)
+    singleton_real = {
+        name for name, (_, etype) in meta_real.items()
+        if etype == "Singleton" and not name.startswith("shadow_")
+    }
+
+    # All member features across all groups
+    all_group_members: set = set()
+    for members in agg_cfg.values():
+        all_group_members.update(members)
+
+    # Ungrouped: singleton real effects not in any group
+    ungrouped_features = {
+        name for name in singleton_real if name not in all_group_members
+    }
+
+    # Build group-total X columns and record their indices
+    group_total_col_idx: Dict[str, int] = {}
+    X_stacked = X_stacked.copy()
+    for group_name, members in agg_cfg.items():
+        existing = [m for m in members if m in X_stacked.columns]
+        if existing:
+            X_stacked[group_name] = X_stacked[existing].sum(axis=1, min_count=len(existing))
+        else:
+            X_stacked[group_name] = np.nan
+        col_idx = X_stacked.columns.get_loc(group_name)
+        group_total_col_idx[group_name] = col_idx
+        feature_types[group_name] = "continuous"
+
+    # Helper: sum a list of columns from a dataframe, skipping missing ones
+    def _sum_cols(df: pd.DataFrame, cols: List[str]) -> Optional[pd.Series]:
+        present = [c for c in cols if c in df.columns]
+        if not present:
+            return None
+        return df[present].sum(axis=1)
+
+    # Helper: find interaction column name for a pair (try both orderings)
+    def _inter_col(df: pd.DataFrame, a: str, b: str) -> Optional[str]:
+        if f"{a} x {b}" in df.columns:
+            return f"{a} x {b}"
+        if f"{b} x {a}" in df.columns:
+            return f"{b} x {a}"
+        return None
+
+    df_shap_real = df_shap_real.copy()
+    df_shap_shadow = df_shap_shadow.copy()
+    meta_real = dict(meta_real)
+    meta_shadow = dict(meta_shadow)
+
+    group_names_sorted = sorted(agg_cfg.keys())
+
+    for group_name, members in agg_cfg.items():
+        g_idx = group_total_col_idx[group_name]
+
+        # --- Singleton aggregate ---
+        singleton_cols = [m for m in members if m in singleton_real and m in df_shap_real.columns]
+        agg_val = _sum_cols(df_shap_real, singleton_cols)
+        if agg_val is not None:
+            df_shap_real[group_name] = agg_val
+            meta_real[group_name] = ((g_idx, g_idx), "Singleton")
+        # Shadow singleton aggregate
+        shadow_singleton_cols = [f"shadow_{m}" for m in members if f"shadow_{m}" in df_shap_shadow.columns]
+        shadow_agg_val = _sum_cols(df_shap_shadow, shadow_singleton_cols)
+        shadow_col_name = f"shadow_{group_name}"
+        if shadow_agg_val is not None:
+            df_shap_shadow[shadow_col_name] = shadow_agg_val
+            meta_shadow[shadow_col_name] = ((g_idx, g_idx), "Singleton")
+
+        # --- Within-group interaction aggregate ---
+        within_cols = []
+        for fi, fj in combinations(members, 2):
+            col = _inter_col(df_shap_real, fi, fj)
+            if col is not None:
+                within_cols.append(col)
+        if within_cols:
+            within_col_name = f"{group_name} x {group_name}"
+            df_shap_real[within_col_name] = _sum_cols(df_shap_real, within_cols)
+            meta_real[within_col_name] = ((g_idx, g_idx), "Interaction")
+        # Shadow within-group interaction
+        shadow_within_cols = []
+        for fi, fj in combinations(members, 2):
+            col = _inter_col(df_shap_shadow, f"shadow_{fi}", f"shadow_{fj}")
+            if col is not None:
+                shadow_within_cols.append(col)
+        if shadow_within_cols:
+            shadow_within_name = f"shadow_{group_name} x shadow_{group_name}"
+            df_shap_shadow[shadow_within_name] = _sum_cols(df_shap_shadow, shadow_within_cols)
+            meta_shadow[shadow_within_name] = ((g_idx, g_idx), "Interaction")
+
+    # --- Between-group interaction aggregates ---
+    for g1_name, g2_name in combinations(group_names_sorted, 2):
+        g1_members = agg_cfg[g1_name]
+        g2_members = agg_cfg[g2_name]
+        g1_idx = group_total_col_idx[g1_name]
+        g2_idx = group_total_col_idx[g2_name]
+        between_col_name = f"{g1_name} x {g2_name}"
+
+        between_cols = []
+        for fi in g1_members:
+            for gj in g2_members:
+                col = _inter_col(df_shap_real, fi, gj)
+                if col is not None:
+                    between_cols.append(col)
+        if between_cols:
+            df_shap_real[between_col_name] = _sum_cols(df_shap_real, between_cols)
+            meta_real[between_col_name] = ((g1_idx, g2_idx), "Interaction")
+
+        # Shadow between-group
+        shadow_between_cols = []
+        for fi in g1_members:
+            for gj in g2_members:
+                col = _inter_col(df_shap_shadow, f"shadow_{fi}", f"shadow_{gj}")
+                if col is not None:
+                    shadow_between_cols.append(col)
+        if shadow_between_cols:
+            shadow_between_name = f"shadow_{g1_name} x shadow_{g2_name}"
+            df_shap_shadow[shadow_between_name] = _sum_cols(df_shap_shadow, shadow_between_cols)
+            meta_shadow[shadow_between_name] = ((g1_idx, g2_idx), "Interaction")
+
+    # --- Group x ungrouped interaction aggregates ---
+    for group_name, members in agg_cfg.items():
+        g_idx = group_total_col_idx[group_name]
+        for u in sorted(ungrouped_features):
+            if u not in df_shap_real.columns and not any(
+                _inter_col(df_shap_real, fi, u) for fi in members
+            ):
+                continue
+            gu_cols = []
+            for fi in members:
+                col = _inter_col(df_shap_real, fi, u)
+                if col is not None:
+                    gu_cols.append(col)
+            if gu_cols:
+                # Column name: group_name x u (alphabetical on the two "super" names)
+                parts_sorted = sorted([group_name, u])
+                gu_col_name = f"{parts_sorted[0]} x {parts_sorted[1]}"
+                u_idx = X_stacked.columns.get_loc(u) if u in X_stacked.columns else g_idx
+                df_shap_real[gu_col_name] = _sum_cols(df_shap_real, gu_cols)
+                meta_real[gu_col_name] = ((g_idx, u_idx), "Interaction")
+
+            # Shadow group x ungrouped
+            shadow_gu_cols = []
+            for fi in members:
+                col = _inter_col(df_shap_shadow, f"shadow_{fi}", f"shadow_{u}")
+                if col is not None:
+                    shadow_gu_cols.append(col)
+            if shadow_gu_cols:
+                parts_sorted = sorted([group_name, u])
+                shadow_gu_name = f"shadow_{parts_sorted[0]} x shadow_{parts_sorted[1]}"
+                u_idx = X_stacked.columns.get_loc(u) if u in X_stacked.columns else g_idx
+                df_shap_shadow[shadow_gu_name] = _sum_cols(df_shap_shadow, shadow_gu_cols)
+                meta_shadow[shadow_gu_name] = ((g_idx, u_idx), "Interaction")
+
+    return df_shap_real, df_shap_shadow, X_stacked, meta_real, meta_shadow, feature_types
+
+
 # -----------------------------------------------------------------------------
 # 4. Bootstrap Engine & Output Handlers
 # -----------------------------------------------------------------------------
@@ -684,9 +911,11 @@ def _process_and_save_microdata(
             block["partner_value"] = df_X[fb].astype(str).values
 
             # NEW Additive Columns
-            block["main_feature_raw"] = df_X_raw[fa].astype(str).values
+            raw_src_fa = df_X_raw if fa in df_X_raw.columns else df_X
+            block["main_feature_raw"] = raw_src_fa[fa].astype(str).values
             block["main_feature_type"] = feature_types.get(fa, "unknown")
-            block["partner_feature_raw"] = df_X_raw[fb].astype(str).values
+            raw_src_fb = df_X_raw if fb in df_X_raw.columns else df_X
+            block["partner_feature_raw"] = raw_src_fb[fb].astype(str).values
             block["partner_feature_type"] = feature_types.get(fb, "unknown")
 
         else:
@@ -697,7 +926,8 @@ def _process_and_save_microdata(
             block["partner_value"] = None
 
             # NEW Additive Columns
-            block["main_feature_raw"] = df_X_raw[eff].astype(str).values
+            raw_src = df_X_raw if eff in df_X_raw.columns else df_X
+            block["main_feature_raw"] = raw_src[eff].astype(str).values
             block["main_feature_type"] = feature_types.get(eff, "unknown")
             block["partner_feature_raw"] = None
             block["partner_feature_type"] = None
@@ -939,8 +1169,10 @@ def _run_bootstrap_pipeline(
         """Apply BH-FDR correction to a pooled p-value vector with NaN pass-through.
 
         Applied to the pooled set of all effects (singletons + interactions across
-        all noise strata). NaN p-values (from failed calculations) are excluded from
-        the BH denominator and restored as NaN q-values after correction.
+        all noise strata). NaN p-values (from failed calculations) are replaced with
+        1.0 conservative placeholders that remain in the BH denominator, inflating m
+        and making the correction slightly more conservative for non-NaN effects.
+        After correction, NaN entries are restored as NaN q-values.
         No cross-family correction is applied between sig_M, sig_V, and sig_GII;
         each family receives an independent BH call.
 
@@ -1014,6 +1246,11 @@ def _run_bootstrap_pipeline(
         # v_failure_rate: fraction of bootstrap iterations where V spline fitting
         # failed (returned NaN). High rates (>5%) indicate unreliable V estimates.
         "v_failure_rate": v_failure_rate,
+
+        # is_aggregate: True when the effect is or involves an aggregate group
+        # defined via config["aggregate_shap"]. False for all native effects and
+        # when aggregate_shap is absent or empty.
+        "is_aggregate": [_is_aggregate_effect(n, config) for n in effect_names],
     })
 
     # Rank by Q-value then GII
@@ -1040,7 +1277,14 @@ def _run_bootstrap_pipeline(
         df_shap_micro = df_shap.copy()
         df_shap_micro.index = cluster_ids
         df_shap_micro = df_shap_micro.groupby(level=0).mean()
-        X_micro = X_display[real_feature_names] if X_display is not None else X_real_for_micro.iloc[:len(df_shap_micro)]
+        if X_display is not None:
+            missing = [c for c in real_feature_names if c not in X_display.columns]
+            X_micro = X_display[[c for c in real_feature_names if c in X_display.columns]].copy()
+            for c in missing:
+                if c in X_full.columns:
+                    X_micro[c] = X_full[c].values[:len(X_micro)]
+        else:
+            X_micro = X_real_for_micro.iloc[:len(df_shap_micro)]
         X_micro.index = df_shap_micro.index
         ids_micro = ids
     else:
@@ -1096,11 +1340,9 @@ def _run_shap_for_slice(
 
         rng = np.random.default_rng(config["execution"]["random_seed"] + fold_idx + 1000)
         X_val_shadow = X_val_real.copy()
-        for c in X_val_shadow.columns:
-            orig_dtype = X_val_shadow[c].dtype
-            X_val_shadow[c] = rng.permutation(X_val_shadow[c].values)
-            if orig_dtype.name == 'category':
-                X_val_shadow[c] = X_val_shadow[c].astype(orig_dtype)
+
+        agg_groups = config.get("aggregate_shap", {})
+        _block_permute_shadow(X_val_shadow, agg_groups, rng)
         X_val_shadow.columns = [f"shadow_{c}" for c in X_val_shadow.columns]
 
         X_full = pd.concat([X_val_real, X_val_shadow], axis=1)
@@ -1159,9 +1401,9 @@ def _run_shap_for_slice(
         df_shap_real_full = df_shap_real_full.reset_index(drop=True)
         df_shap_shadow_full = df_shap_shadow_full.reset_index(drop=True)
 
-        # X_stacked: tile the single X matrix K times to match K*N SHAP rows
+        # X_stacked: concatenate all K folds' X matrices to preserve per-fold shadow features
         n_folds = len(chunks_X)
-        X_stacked = pd.concat([chunks_X[0]] * n_folds, ignore_index=True)
+        X_stacked = pd.concat(chunks_X, ignore_index=True)
 
         # Save averaged version to parquet for human readability (one row per obs)
         df_shap_real_avg = pd.concat(chunks_real).groupby(level=0).mean().fillna(0.0)
@@ -1179,6 +1421,13 @@ def _run_shap_for_slice(
 
         _to_parquet_atomic(df_shap_real, os.path.join(shap_dir, "real_shap_interaction_matrix.parquet"))
         _to_parquet_atomic(df_shap_shadow, os.path.join(shap_dir, "shadow_shap_interaction_matrix.parquet"))
+
+    # Aggregate SHAP effects per aggregate_shap config (no-op when key is absent)
+    (df_shap_real, df_shap_shadow, X_stacked,
+     meta_real, meta_shadow_all, all_feature_types) = _aggregate_effects(
+        df_shap_real, df_shap_shadow, X_stacked,
+        config, meta_real, meta_shadow_all, all_feature_types
+    )
 
     nan_mask = X_stacked.isnull().values
 
@@ -1220,6 +1469,8 @@ def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
     ctx : dict
         Pipeline context dictionary with keys:
         - run_dir (str): output directory for SHAP artifacts.
+        - train_dir (str, optional): directory containing trained model files.
+          Defaults to run_dir when absent (predict.py case).
         - config (dict): full pipeline config.
         - task (str): task type string.
         - feature_names (list[str]): real feature names (no shadow_ prefix).
@@ -1245,7 +1496,8 @@ def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
     target_labels = ctx.get("target_labels", None)
     inference_mode = ctx.get("inference_mode", False)
 
-    shadow_paths = _discover_shadow_models(run_dir)
+    train_dir = ctx.get("train_dir", run_dir)
+    shadow_paths = _discover_shadow_models(train_dir)
     if not shadow_paths:
         print("[SHAP] No shadow (Boruta) models found. Skipping SHAP analysis.")
         return

@@ -16,7 +16,7 @@ AI assistance was utilized for **analysis pipeline development**, encompassing:
 - Statistical methodology review and validation
 - Implementation of pipeline modules
 - Test suite development and validation
-- Documentation authoring and refinement
+- Documentation updates and refinement
 
 AI was **not** used for:
 
@@ -30,10 +30,10 @@ The boost-shap-gii pipeline is a general-purpose tool for gradient boosting with
 
 Development utilized **Claude Code** (Anthropic), employing two model tiers:
 
-| Model | Role | Tasks |
-|-------|------|-------|
+| Model | Usage | Tasks |
+|-------|----------|-------|
 | Claude Opus 4 | Analytical and review | Critical review of statistical methods, brainstorming sessions, code quality audits, risk assessment, and architectural decisions |
-| Claude Sonnet 4 | Implementation | Code generation, test implementation, documentation drafting, and file management |
+| Claude Sonnet 4 | Implementation | Code scaffolding under direction, test implementation support, documentation updates, and file management |
 
 This dual-model approach ensured that analytical depth (Opus) was applied to decisions with statistical or methodological consequences, while implementation efficiency (Sonnet) was used for well-specified coding tasks under explicit human direction.
 
@@ -51,7 +51,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 
 5. **Clean** -- Code quality review for consistency, style, and maintainability.
 
-6. **Document** -- Authoring and updating of user-facing documentation (README.md) and machine-readable technical specifications (INPUT_SPECIFICATION.md).
+6. **Document** -- Updating and maintaining user-facing documentation (README.md) and machine-readable technical specifications (INPUT_SPECIFICATION.md).
 
 Key properties of this workflow:
 
@@ -109,10 +109,10 @@ Raw session transcripts are excluded for privacy reasons. The structured reports
 
 **LLM tools used:**
 
-- Claude Opus 4.7 (Anthropic): orchestrator role -- brainstorm sessions, implementation plan authoring, algorithmic design review, plan-discipline verification.
-- Claude Sonnet 4.6 (Anthropic): build-agent role -- code generation, config edits, documentation drafting, file management.
+- Claude Opus 4.7 (Anthropic): orchestrator role -- brainstorm sessions, implementation plan structuring support, algorithmic design review, plan-discipline verification.
+- Claude Sonnet 4.6 (Anthropic): build-agent role -- code scaffolding under direction, config edits, documentation updates, file management.
 
-No LLM was granted co-authorship or scientific credit. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
+LLM tool use carries no claim to scientific credit under project policy. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
 
 **Key algorithmic decisions (researcher-approved):**
 
@@ -164,10 +164,10 @@ No LLM was granted co-authorship or scientific credit. All algorithmic decisions
 
 **LLM tools used:**
 
-- Claude Opus 4.7 (Anthropic): orchestrator role -- critical review, brainstorm sessions, implementation plan authoring, disposition adjudication.
-- Claude Sonnet 4.6 (Anthropic): build-agent role -- code generation, test implementation, documentation edits, file management.
+- Claude Opus 4.7 (Anthropic): orchestrator role -- critical review, brainstorm sessions, implementation plan structuring support, disposition adjudication.
+- Claude Sonnet 4.6 (Anthropic): build-agent role -- code scaffolding under direction, test implementation support, documentation updates, file management.
 
-No LLM was granted co-authorship or scientific credit. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
+LLM tool use carries no claim to scientific credit under project policy. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
 
 **Key algorithmic decisions (researcher-approved):**
 
@@ -190,7 +190,67 @@ No LLM was granted co-authorship or scientific credit. All algorithmic decisions
 
 ---
 
+### Session 2026-08-12 -- Post-release maintenance and aggregate SHAP feature
+
+**Date:** 2026-08-12
+
+**Session scope:**
+
+- Full independent critical review (CR) of the pipeline (blank-slate, not based on prior session memory). Produced 3 minor findings; overall assessment: defensible; 0 critical, 0 major.
+- Brainstorm session to validate proposed fixes and check for interactions with the existing pipeline. All three solutions confirmed sound with zero interaction risk.
+- Implementation of aggregate SHAP (group-level GII) feature and 3 minor fixes:
+  - *Aggregate SHAP feature*: new `aggregate_shap` config block enabling post-hoc group-level SHAP analysis. Sums member SHAP values within user-defined feature groups to compute group-level M, V, and GII. Produces singleton aggregates, within-group interaction aggregates, between-group interaction aggregates, and group-by-ungrouped interaction aggregates. Shadow noise calibration uses block-permutation (Au et al. 2022, S1) to preserve within-group correlation. Implemented across `utils.py` (`_block_permute_shadow`), `train.py` (`_validate_aggregate_shap`, block-permute integration), `shap_utils.py` (`_aggregate_effects`, `_is_aggregate_effect`, `is_aggregate` output flag, X_micro fallback for aggregate columns), and `infer.py` (`train_dir` context key separation). Config template updated in `example_config_advanced.yaml`. CatBoost refit HP strategy changed from allowlist to blocklist in `indiv_reports.py` (`_extract_user_level_params`).
+  - *Docstring correction for `_nan_safe_fdr`*: the docstring incorrectly claimed NaN p-values were "excluded from the BH denominator." The code replaces them with 1.0 conservative placeholders that remain in the denominator (slightly more conservative than documented). Docstring corrected to describe the actual behavior. No code logic changed.
+  - *Pre-flight CatBoost refit probe*: new `_probe_and_strip_refit_params` helper in `indiv_reports.py`. Trial-constructs a CatBoost model once before the bootstrap-of-CV loop to discover any internal-only parameters not covered by the static blocklist. Discovered params are stripped from all fold HP dicts and a `RuntimeWarning` is emitted. Defends against future CatBoost version upgrades that may add new internal-only keys to `get_all_params()`.
+  - *Inference-mode X_stacked shadow feature correction*: replaced fold-0 tiling (`pd.concat([chunks_X[0]] * n_folds)`) with full concatenation (`pd.concat(chunks_X, ignore_index=True)`) in `shap_utils.py`. Preserves each fold's independent shadow permutation for correct shadow V computation in the exceedance test. Prior behavior used fold 0's shadow features for all K copies, creating a minor anti-conservative bias in the shadow noise distribution.
+- Documentation: README.md updated with Aggregate SHAP section; INPUT_SPECIFICATION.md updated with config reference, aggregation algorithm, block-permutation details, `is_aggregate` column, and edge cases.
+- Test suite: 5 new tests for the pre-flight probe helper; 1 re-expressed test (strengthened postcondition) for the X_stacked fix. Post-session: 658 tests across 17 test files; 658 passing, 0 failing.
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): orchestrator role -- critical review, brainstorm, implementation plan structuring support.
+- Claude Sonnet 4.6 (Anthropic): build-agent role -- code scaffolding under direction, test execution support.
+- Claude Sonnet 5 (Anthropic): test suite execution support and test run orchestration.
+
+LLM tool use carries no claim to scientific credit under project policy. All decisions were made by the researcher prior to any code-generation step.
+
+**Key decisions (researcher-approved):**
+
+- *Aggregate SHAP design*: the researcher designed the aggregate_shap config block, the block-permutation strategy (Au et al. 2022, S1), the four aggregate effect types (singleton, within-group, between-group, group-by-ungrouped), validation rules (disjoint membership, no nominal features, name-collision prohibition), and the `is_aggregate` output flag.
+- *Allowlist-to-blocklist refit strategy*: the researcher approved replacing the CatBoost HP allowlist with a blocklist approach (all params pass except known internal-only keys), combined with the pre-flight probe fallback for unknown rejected keys.
+- *Docstring-only fix for `_nan_safe_fdr`*: the researcher chose to correct the documentation rather than implement true BH denominator exclusion, preserving the slightly conservative behavior against which the simulation study baseline was run.
+- *Pre-flight probe design*: the researcher approved Option B (single trial construction before the bootstrap loop, capped at 5 retries) over alternatives (try/except inside the hot loop, or CatBoost version pinning).
+- *X_stacked tiling fix*: the researcher approved the one-line change after a brainstorm session verified zero interaction risk across all seven downstream consumers.
+
+**Test metrics:**
+
+- Pre-session: 653 tests across 17 test files (653 passing, 0 failing).
+- Post-session: 658 tests across 17 test files (658 passing, 0 failing).
+
+**Audit trail references (.aid/reports/):**
+
+- Critical review: `boost-shap-gii_cr_20260812_142729.md`
+- Brainstorm: `boost-shap-gii_brainstorm_20260812_144151.md`
+- Implementation plan: `boost-shap-gii_implement_plan_20260812_144410.md`
+- Implementation build: `boost-shap-gii_implement_build_20260812_144717.md`
+- Test report: `boost-shap-gii_test_20260812_150327.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Version 1.3.0 -- 2026-08-12 (aggregate SHAP feature and post-release maintenance)
+
+This release adds user-configurable group-level SHAP analysis and resolves three minor post-release findings from independent critical review.
+
+- **Aggregate SHAP (group-level GII)**: new `aggregate_shap` config block enables post-hoc group-level importance analysis. Users define feature groups; the pipeline computes group-level M, V, and GII via SHAP additivity. Shadow noise calibration uses block-permutation (Au et al. 2022, S1) to preserve within-group correlation. Four aggregate effect types produced: singleton, within-group interaction, between-group interaction, and group-by-ungrouped interaction. Results flagged with `is_aggregate = True` in `shap_stats_global.csv`.
+- **Allowlist-to-blocklist CatBoost refit strategy**: `indiv_reports.py` HP handling changed from an allowlist (explicit list of known-good params) to a blocklist (all params pass except known internal-only keys), with a pre-flight probe (`_probe_and_strip_refit_params`) as a safety net for undiscovered internal params.
+- **`_nan_safe_fdr` docstring correction**: docstring updated to describe actual NaN-to-1.0 conservative-placeholder behavior (code unchanged).
+- **Inference-mode X_stacked shadow feature correction**: fold-0 tiling replaced with full concatenation to preserve per-fold independent shadow permutations for correct shadow V computation.
+- **Documentation**: README.md and INPUT_SPECIFICATION.md updated with aggregate SHAP config reference, algorithmic details, and edge cases.
+- **Tests**: 5 new tests (pre-flight probe helper); 1 re-expressed test (X_stacked, strengthened postcondition). Post-session: 658/658 passing.
+
+---
 
 ### Version 1.2.0 -- 2026-05-08 (CR-remediation release)
 

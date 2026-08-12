@@ -27,6 +27,7 @@ from optuna.samplers import TPESampler
 
 from .utils import (
     _normalize_quotes,
+    _block_permute_shadow,
     load_config,
     save_json_atomic,
     detect_task,
@@ -398,6 +399,75 @@ def _write_train_outcome_stats(
     save_json_atomic(payload, os.path.join(run_dir, "train_outcome_stats.json"))
 
 
+def _validate_aggregate_shap(config: dict, final_cols: list, nom_feats: list) -> None:
+    """Validate the aggregate_shap config block against the resolved feature set.
+
+    Enforces five invariants before any model training occurs:
+    (1) no group name collides with a resolved feature name,
+    (2) each group has at least one member,
+    (3) single-member groups emit a WARNING (no aggregation benefit),
+    (4) every constituent exists in the resolved feature set,
+    (5) nominal features are prohibited from aggregate groups (SHAP values for
+        nominal/categorical features are not directly comparable across levels),
+    (6) constituent membership is disjoint across groups.
+
+    Parameters
+    ----------
+    config : dict
+        Full pipeline config.
+    final_cols : list[str]
+        Resolved feature columns after all-missing-column drops.
+    nom_feats : list[str]
+        Resolved nominal feature names after all-missing-column drops.
+    """
+    agg_cfg = config.get("aggregate_shap", {})
+    if not agg_cfg:
+        return
+
+    all_constituents: set = set()
+    for group_name, members in agg_cfg.items():
+        if group_name in final_cols:
+            raise ValueError(
+                f"aggregate_shap group name '{group_name}' collides with a "
+                f"resolved feature column name. Rename the group."
+            )
+        if not isinstance(members, list) or len(members) == 0:
+            raise ValueError(
+                f"aggregate_shap group '{group_name}' has an empty or invalid "
+                f"feature list. Provide at least one constituent feature name."
+            )
+        if len(members) == 1:
+            print(
+                f"[WARNING] aggregate_shap group '{group_name}' has only one "
+                f"constituent feature; no aggregation benefit will be realized."
+            )
+        for feat in members:
+            if feat not in final_cols:
+                raise ValueError(
+                    f"aggregate_shap constituent '{feat}' in group '{group_name}' "
+                    f"is not in the resolved feature set. Check for typos or "
+                    f"all-missing column drops."
+                )
+            if feat in nom_feats:
+                raise ValueError(
+                    f"aggregate_shap constituent '{feat}' in group '{group_name}' "
+                    f"is a nominal feature. Nominal features are not permitted in "
+                    f"aggregate groups because their SHAP values are not directly "
+                    f"comparable across levels."
+                )
+            if feat in all_constituents:
+                raise ValueError(
+                    f"aggregate_shap constituent '{feat}' appears in multiple "
+                    f"groups. Disjoint membership is required across all groups."
+                )
+            all_constituents.add(feat)
+
+    print(
+        f"[INFO] aggregate_shap: {len(agg_cfg)} group(s) validated, "
+        f"{len(all_constituents)} constituent features."
+    )
+
+
 # -----------------------------------------------------------------------------
 # 2. Core Optimization Logic
 # -----------------------------------------------------------------------------
@@ -635,6 +705,9 @@ def main():
         con_feats = [c for c in con_feats if c not in all_missing]
         ord_feats = [c for c in ord_feats if c not in all_missing]
         nom_feats = [c for c in nom_feats if c not in all_missing]
+
+    # 3d. Validate aggregate_shap config against resolved feature set
+    _validate_aggregate_shap(config, final_cols, nom_feats)
 
     # 4. Type Enforcement & Preprocessing
     X = df_raw[final_cols].copy()
@@ -918,16 +991,9 @@ def main():
         # Permute columns independently
         rng = np.random.default_rng(config["execution"]["random_seed"] + fold_idx)
 
-        for c in X_train_shadow.columns:
-            orig_dtype = X_train_shadow[c].dtype
-            X_train_shadow[c] = rng.permutation(X_train_shadow[c].values)
-            if orig_dtype.name == 'category':
-                X_train_shadow[c] = X_train_shadow[c].astype(orig_dtype)
-        for c in X_val_shadow.columns:
-            orig_dtype = X_val_shadow[c].dtype
-            X_val_shadow[c] = rng.permutation(X_val_shadow[c].values)
-            if orig_dtype.name == 'category':
-                X_val_shadow[c] = X_val_shadow[c].astype(orig_dtype)
+        agg_groups = config.get("aggregate_shap", {})
+        _block_permute_shadow(X_train_shadow, agg_groups, rng)
+        _block_permute_shadow(X_val_shadow, agg_groups, rng)
 
         # Rename columns
         X_train_shadow.columns = [f"shadow_{c}" for c in X_train_shadow.columns]

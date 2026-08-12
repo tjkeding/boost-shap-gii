@@ -510,7 +510,8 @@ def main():
             y_for_shap = df_raw[outcome_cols[0]].copy()
 
     shap_ctx = {
-        "run_dir": train_dir,
+        "run_dir": infer_dir,
+        "train_dir": train_dir,
         "config": config,
         "task": task,
         "feature_names": trained_features,
@@ -525,9 +526,6 @@ def main():
         "target_labels": target_labels,
         "inference_mode": True,
     }
-
-    # Override run_dir so SHAP outputs go to the inference directory
-    shap_ctx["run_dir"] = infer_dir
 
     if config["shap"].get("compute_global_on_inference", False):
         run_shap_pipeline(shap_ctx)

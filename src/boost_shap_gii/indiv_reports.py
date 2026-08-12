@@ -52,6 +52,8 @@ import datetime
 import glob
 import json
 import os
+import re
+import warnings
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -69,28 +71,21 @@ OOB_FLOOR_MIN: int = 50   # individuals with fewer OOB refits emit NaN CI bounds
 CI_LO_PCT: float = 2.5
 CI_HI_PCT: float = 97.5
 
-# Allowlist of user-facing CatBoost HP keys that are safe to pass on refit.
-# Runtime/internal keys are excluded to avoid conflicts with Pool cat_features.
-_CATBOOST_USER_PARAM_ALLOWLIST = {
-    "iterations",
-    "depth",
-    "learning_rate",
-    "loss_function",
-    "border_count",
-    "l2_leaf_reg",
-    "bagging_temperature",
-    "random_strength",
-    "random_seed",
-    "min_data_in_leaf",
-    "colsample_bylevel",
-    "one_hot_max_size",
-    "eval_metric",
-    "class_weights",
-    "scale_pos_weight",
-    "custom_loss",
-    "boosting_type",
-    "bootstrap_type",
-    "subsample",
+# Blocklist of internal/runtime CatBoost keys excluded from refit params
+# to avoid conflicts with Pool construction (e.g., cat_features, task_type).
+_CATBOOST_REFIT_BLOCKLIST = {
+    "cat_features",
+    "text_features",
+    "embedding_features",
+    "task_type",
+    "devices",
+    "auto_class_weights",
+    "bayesian_matrix_reg",
+    "class_names",
+    "classes_count",
+    "force_unit_auto_pair_weights",
+    "permutation_count",
+    "pool_metainfo_options",
 }
 
 
@@ -99,8 +94,47 @@ _CATBOOST_USER_PARAM_ALLOWLIST = {
 # ---------------------------------------------------------------------------
 
 def _extract_user_level_params(all_params: dict) -> dict:
-    """Return only the allowlisted user-facing HP subset from get_all_params()."""
-    return {k: v for k, v in all_params.items() if k in _CATBOOST_USER_PARAM_ALLOWLIST}
+    """Return all params except blocklisted internal/runtime keys."""
+    return {k: v for k, v in all_params.items() if k not in _CATBOOST_REFIT_BLOCKLIST}
+
+
+def _probe_and_strip_refit_params(frozen_hps: List[dict], task: str) -> List[dict]:
+    """Trial-construct a CatBoost model to discover params rejected by the constructor.
+
+    Iteratively attempts construction, stripping offending params on each TypeError,
+    up to 5 retries. Discovered params are removed from ALL frozen_hps entries.
+    A single RuntimeWarning is emitted listing discovered params and CatBoost version.
+    """
+    probe_params = dict(frozen_hps[0])
+    probe_params["verbose"] = False
+    probe_params["allow_writing_files"] = False
+    cls = CatBoostRegressor if task in ("regression", "multi_regression") else CatBoostClassifier
+    discovered: list = []
+    for _ in range(5):
+        try:
+            cls(**probe_params)
+            break
+        except TypeError as exc:
+            match = re.search(r"unexpected keyword argument '(\w+)'", str(exc))
+            if not match:
+                break
+            bad_key = match.group(1)
+            discovered.append(bad_key)
+            probe_params.pop(bad_key, None)
+    if discovered:
+        import catboost as _cb
+        cb_ver = getattr(_cb, "__version__", "unknown")
+        warnings.warn(
+            f"CatBoost {cb_ver} returned internal params not in the static blocklist: "
+            f"{discovered}. These were stripped from refit hyperparameters.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        stripped = []
+        for hp in frozen_hps:
+            stripped.append({k: v for k, v in hp.items() if k not in discovered})
+        return stripped
+    return frozen_hps
 
 
 def _load_one_model(model_path: str, task: str) -> Union[CatBoostRegressor, CatBoostClassifier]:
@@ -1004,6 +1038,7 @@ def generate_indiv_reports(
         frozen_hps: List[dict] = [
             _extract_user_level_params(m.get_all_params()) for m in orig_models
         ]
+        frozen_hps = _probe_and_strip_refit_params(frozen_hps, task)
 
         # Build the inference Pool for SHAP computation inside bootstrap-of-CV.
         pool_infer_tgt = Pool(X_target, cat_features=cat_feats)

@@ -138,6 +138,44 @@ The shadow noise distribution used for significance testing is derived from a sh
 
 ---
 
+## Aggregate SHAP (Group-Level GII)
+
+When features form a natural group (e.g., items in a psychometric subscale, related biomarkers), the pipeline can compute group-level M, V, and GII by summing member SHAP values within user-defined groups.
+
+### Configuration
+
+Add an `aggregate_shap` block to the config (top-level, alongside `shap` and `plot`):
+
+```yaml
+aggregate_shap:
+  subscale_A_total:
+    - "subscale_A_item1"
+    - "subscale_A_item2"
+    - "subscale_A_item3"
+  subscale_B_total:
+    - "subscale_B_item1"
+    - "subscale_B_item2"
+```
+
+### Constraints
+- Each feature may belong to **at most one group** (disjoint membership).
+- **Nominal features are not permitted** in aggregate groups (SHAP values for categorical features are not directly comparable across levels).
+- Group names must not collide with existing feature column names.
+- Single-member groups emit a warning (no aggregation benefit).
+
+### What It Produces
+For each group, the pipeline emits:
+- **Singleton aggregate**: group-level main effect (sum of member singleton SHAP values).
+- **Within-group interaction**: sum of all pairwise member-by-member interactions.
+- **Between-group interactions**: sum of cross-group pairwise interactions (when multiple groups are defined).
+- **Group-by-ungrouped interactions**: sum of interactions between group members and features not in any group.
+
+All aggregate effects receive shadow-calibrated significance testing via block-permuted Boruta exceedance (Au et al. 2022), where grouped shadow features share a single permutation index per group to preserve within-group correlation structure.
+
+Results appear in `shap_stats_global.csv` with `is_aggregate = True`. See `INPUT_SPECIFICATION.md` Section 4 for full algorithmic details.
+
+---
+
 ## Per-individual SHAP reports
 
 When `shap.indiv_ci_nboot > 0`, each `predict` and `infer` run generates per-individual SHAP attribution plots with bootstrap confidence intervals. Reports are written to `indiv_reports/` within the respective output directory.

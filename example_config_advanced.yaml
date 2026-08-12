@@ -173,6 +173,21 @@ shap:
     # (distribution-shift diagnostic at large N). Default false because small-N inference sets
     # produce degenerate GII.
 
+# aggregate_shap:
+#   # Post-hoc group-level SHAP analysis. Sums individual SHAP values
+#   # within user-defined groups to compute group-level M, V, and GII.
+#   # Each feature may belong to at most one group. Nominal features
+#   # are not permitted. Groups receive shadow-calibrated significance
+#   # testing via block-permuted Boruta exceedance.
+#   #
+#   # subscale_A_total:
+#   #   - "subscale_A_item1"
+#   #   - "subscale_A_item2"
+#   #   - "subscale_A_item3"
+#   # subscale_B_total:
+#   #   - "subscale_B_item1"
+#   #   - "subscale_B_item2"
+
 plot:
   outcome_max: 100.0
     # Theoretical maximum value of the outcome (used to scale GII magnitudes on plots).
