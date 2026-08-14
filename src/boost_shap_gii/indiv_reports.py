@@ -8,7 +8,9 @@ y_train[s_b]) using params_k = get_all_params(model_fold_{k}.cbm). Total refits 
 
 Inference mode: bootstrap-of-CV design. Per iteration b: draw one bootstrap sample
 s_b (size N_train, with replacement, cluster-aware when cluster_ids present); generate a
-fresh K-fold split on s_b (KFold/StratifiedKFold, seed = random_seed + b + 1); for each
+fresh K-fold split on s_b via get_cv_splitter (respecting cv_strategy for uniform/stratified;
+falling back to KFold for group CV because bootstrap resampling breaks group structure;
+seed = random_seed + b + 1); for each
 fold k refit CatBoost on the fold-train portion of s_b using frozen fold_hyperparameters[k]
 (no HP retuning); compute SHAP on the inference pool from each of the K refits and average
 to produce ONE ensemble-replicate per b. CIs are basic/reverse-percentile intervals:
@@ -59,7 +61,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from catboost import CatBoost, CatBoostClassifier, CatBoostRegressor, Pool
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import KFold
 
 from .utils import get_cv_splitter, save_json_atomic
 
@@ -220,26 +222,20 @@ def _reconstruct_fold_assignments(
     config: dict,
     X_train: pd.DataFrame,
     y_train: Union[pd.Series, pd.DataFrame],
+    train_dir: str = None,
 ) -> np.ndarray:
-    """Reconstruct per-individual fold assignments from saved config.
-
-    Mirrors predict.py:222-236 exactly. Raises AssertionError if partition is incomplete.
-
-    Returns
-    -------
-    fold_of : np.ndarray of shape (N_train,), dtype int32
-        fold_of[i] = fold index that individual i was assigned to as the validation fold.
-    """
-    y_for_split = y_train if isinstance(y_train, pd.Series) else y_train.iloc[:, 0]
-    splitter = get_cv_splitter(config, y_for_split)
+    run_dir = train_dir if train_dir is not None else config["paths"]["output_dir"]
+    fold_assignments_path = os.path.join(run_dir, "fold_assignments.json")
+    with open(fold_assignments_path) as f:
+        fold_of = np.array(json.load(f), dtype=np.int32)
     N = len(X_train)
-    fold_of = np.full(N, -1, dtype=np.int32)
-    for fold_idx, (_, val_idx) in enumerate(splitter.split(X_train, y_for_split)):
-        fold_of[val_idx] = fold_idx
+    assert len(fold_of) == N, (
+        f"fold_assignments.json has {len(fold_of)} entries but X_train has {N} rows. "
+        "Verify that the training data matches the training run."
+    )
     assert (fold_of >= 0).all(), (
-        "Fold assignment reconstruction failed: not all individuals were assigned to a "
-        "validation fold. This indicates the CV splitter did not produce a full partition. "
-        "Verify that config random_seed and cv_folds match the training run."
+        "fold_assignments.json contains negative fold indices. "
+        "This indicates a corrupted or incomplete training run."
     )
     return fold_of
 
@@ -280,6 +276,7 @@ def _bootstrap_of_cv_inference(
     cluster_ids: Optional[np.ndarray],
     task: str,
     nom_feats: List[str],
+    config: dict,
     point_shap_main: np.ndarray,
     point_shap_int: Optional[np.ndarray],
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
@@ -288,8 +285,8 @@ def _bootstrap_of_cv_inference(
     For each iteration b in {1, ..., B}:
       1. Draw a bootstrap sample s_b of size N_train from (X_train, y_train).
       2. Generate a fresh K-fold split on s_b (independent of the original training split;
-         seed = random_seed + b + 1) using KFold for regression and StratifiedKFold for
-         classification tasks.
+         seed = random_seed + b + 1) using get_cv_splitter for uniform/stratified strategies,
+         or KFold fallback for group CV (bootstrap resampling breaks group structure).
       3. For each fold k: refit a CatBoost model on the fold-train portion of s_b using
          fold_hyperparameters[k] (no HP retuning).
       4. Compute SHAP main and (when point_shap_int is not None) interaction values from
@@ -361,12 +358,16 @@ def _bootstrap_of_cv_inference(
 
         # Fresh K-fold split on s_b; seed decoupled from s_b draw.
         fold_seed = random_seed + b + 1
-        if is_cls and y_b.ndim == 1:
-            splitter = StratifiedKFold(n_splits=K, shuffle=True, random_state=fold_seed)
-            fold_iter = list(splitter.split(X_b, y_b))
-        else:
+        cv_strategy = config.get("modeling", {}).get("cv_strategy", "uniform")
+        if cv_strategy == "group":
             splitter = KFold(n_splits=K, shuffle=True, random_state=fold_seed)
             fold_iter = list(splitter.split(X_b))
+        else:
+            y_b_series = pd.Series(y_b) if y_b.ndim == 1 else pd.Series(y_b[:, 0])
+            splitter = get_cv_splitter(
+                config, y_b_series, seed_override=fold_seed, n_folds_override=K,
+            )
+            fold_iter = list(splitter.split(X_b, y_b_series))
 
         per_fold_main = np.full((K, N_target, C, F), np.nan, dtype=np.float32)
         if compute_interactions:
@@ -934,7 +935,7 @@ def generate_indiv_reports(
 
     if mode == "training":
         # Reconstruct fold assignments
-        fold_of = _reconstruct_fold_assignments(config, X_train, y_target)
+        fold_of = _reconstruct_fold_assignments(config, X_train, y_target, train_dir=train_dir)
 
         # OOF single-model SHAP: each individual i uses model_fold_{fold_of[i]}.
         # _shap_single always returns (N, C, F) with C=1 for non-multiclass.
@@ -1057,6 +1058,7 @@ def generate_indiv_reports(
                 cluster_ids=infer_cluster_ids,
                 task=task,
                 nom_feats=nom_feats,
+                config=config,
                 point_shap_main=point_shap,
                 point_shap_int=point_shap_int if compute_interactions else None,
             )

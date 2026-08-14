@@ -47,7 +47,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 
 3. **Implement (Plan + Build)** -- Implementation proceeded in two sub-phases: (a) a technical specification mapping each approved change to specific code modifications with risk assessment, and (b) execution of the specification. All plans required human approval before code generation began.
 
-4. **Test** -- Comprehensive test suite development (625 tests across 17 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
+4. **Test** -- Comprehensive test suite development (705 tests across 19 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
 
 5. **Clean** -- Code quality review for consistency, style, and maintainability.
 
@@ -56,7 +56,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 Key properties of this workflow:
 
 - All decisions required **explicit human approval** before implementation.
-- The pipeline was developed with a **test-first** approach; 625 tests validate statistical correctness, edge-case handling, and integration behavior.
+- The pipeline was developed with a **test-first** approach; 705 tests validate statistical correctness, edge-case handling, and integration behavior.
 - Every statistical and algorithmic choice was subjected to **formal critical review**, with findings documented and triaged individually.
 
 ## 5. Human Oversight
@@ -109,8 +109,8 @@ Raw session transcripts are excluded for privacy reasons. The structured reports
 
 **LLM tools used:**
 
-- Claude Opus 4.7 (Anthropic): orchestrator role -- brainstorm sessions, implementation plan structuring support, algorithmic design review, plan-discipline verification.
-- Claude Sonnet 4.6 (Anthropic): build-agent role -- code scaffolding under direction, config edits, documentation updates, file management.
+- Claude Opus 4.7 (Anthropic): used for brainstorm sessions, implementation plan structuring support, algorithmic design review, plan-discipline verification.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction, config edits, documentation updates, file management.
 
 LLM tool use carries no claim to scientific credit under project policy. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
 
@@ -164,8 +164,8 @@ LLM tool use carries no claim to scientific credit under project policy. All alg
 
 **LLM tools used:**
 
-- Claude Opus 4.7 (Anthropic): orchestrator role -- critical review, brainstorm sessions, implementation plan structuring support, disposition adjudication.
-- Claude Sonnet 4.6 (Anthropic): build-agent role -- code scaffolding under direction, test implementation support, documentation updates, file management.
+- Claude Opus 4.7 (Anthropic): used for critical review, brainstorm sessions, implementation plan structuring support, disposition adjudication.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction, test implementation support, documentation updates, file management.
 
 LLM tool use carries no claim to scientific credit under project policy. All algorithmic decisions, scope determinations, and plan approvals were made by the researcher prior to any code-generation step.
 
@@ -208,9 +208,9 @@ LLM tool use carries no claim to scientific credit under project policy. All alg
 
 **LLM tools used:**
 
-- Claude Opus 4.6 (Anthropic): orchestrator role -- critical review, brainstorm, implementation plan structuring support.
-- Claude Sonnet 4.6 (Anthropic): build-agent role -- code scaffolding under direction, test execution support.
-- Claude Sonnet 5 (Anthropic): test suite execution support and test run orchestration.
+- Claude Opus 4.6 (Anthropic): used for critical review, brainstorm, implementation plan structuring support.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction, test execution support.
+- Claude Sonnet 5 (Anthropic): used for test suite execution support and test run coordination.
 
 LLM tool use carries no claim to scientific credit under project policy. All decisions were made by the researcher prior to any code-generation step.
 
@@ -237,7 +237,109 @@ LLM tool use carries no claim to scientific credit under project policy. All dec
 
 ---
 
+### Session 2026-08-13 -- CV strategy feature and fold-assignment artifact
+
+**Date:** 2026-08-13
+
+**Session scope:**
+
+- Brainstorm session (4 topics) to design the CV strategy feature: literal `cv_strategy` splitter selector (T1: "uniform", "stratified", "group"), inner CV repeats via `n_inner_repeats` (T2), group column exclusion and validation (T3), and fold-assignment persistence as `fold_assignments.json` artifact (T5, replacing the prior splitter-reconstruction approach).
+- Implementation plan and build (7 changes, C1-C7): added `get_cv_splitter()` refactor with three-strategy dispatch, `_StratifiedRegressionKFold` (quantile binning with `pd.qcut`/`pd.cut` fallback), `_GroupKFoldWrapper`, `_RepeatedGroupKFold`, `validate_cv_config()`, and `fill_config_defaults()` extensions in `utils.py` (C1); `train.py` group column exclusion, `fold_assignments.json` persistence, unbalanced-fold and cost warnings (C2); `predict.py` fold-assignment artifact loading replacing splitter reconstruction (C3); `shap_utils.py` fold-assignment artifact loading (C4); `indiv_reports.py` fold-assignment artifact loading and group-strategy bootstrap fallback to plain KFold (C5); `example_config_advanced.yaml` new keys (C6); config validation integration (C7).
+- Test design and execution: 9 pre-design failures all dispositioned as obsolete-test (zero product bugs); 42 new tests in `test_cv_strategy.py`; 9 re-expressed tests across `test_implementation_changes.py`, `test_indiv_reports_unit.py`, and `test_train.py`. Post-design suite: 705/705 passing.
+- Full codebase and documentation clean review (7 findings: 0 critical, 3 major, 2 minor, 2 style/note); all actionable findings are documentation drift from the CV strategy feature (F1-F5), routed to `/document`.
+- Documentation updates: INPUT_SPECIFICATION.md (Stage 0 dependency list corrected, Stage 4 CV description rewritten, Stage 5 fold-assignment artifact loading, config table rows added, Section 10 fold reconstruction paragraph replaced), README.md (new Cross-Validation Strategy section with Group CV and Inner CV Repeats subsections), `indiv_reports.py` module docstring updated.
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for brainstorm, implementation plan, clean review, documentation coordination.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction, documentation edits, file management.
+- Claude Sonnet 5 (Anthropic): used for test design and execution.
+
+LLM tool use carries no claim to scientific credit under project policy. All decisions were made by the researcher prior to any code-generation step.
+
+**Key decisions (researcher-approved):**
+
+- *Literal cv_strategy selector*: the researcher directed "We don't want this option to do anything automatically." Each value is a literal splitter selector regardless of task type, with zero cardinality-dependent or task-dependent branching. This is an explicit, approved backward-compatibility break (prior behavior auto-stratified classification when y had < 20 unique values).
+- *Fold-assignment persistence*: the researcher approved persisting `fold_assignments.json` (integer fold-index array) as an artifact from `train.py`, replacing the prior approach of reconstructing fold assignments at predict-time via `get_cv_splitter()`. This eliminates dependence on data identity, sklearn version determinism, and stratification replication.
+- *Group-strategy bootstrap fallback*: when `cv_strategy="group"`, bootstrap resampling breaks group structure (resampled indices no longer correspond to original group labels). The researcher approved falling back to plain `KFold` for bootstrap inner splits in `indiv_reports.py`, with a logged warning.
+- *_RepeatedGroupKFold design*: no sklearn equivalent exists. The researcher approved a custom implementation that permutes group-to-fold mapping per repeat with a seeded RNG while preserving group integrity (all observations sharing a group label remain in the same fold).
+- *Quantile-binned regression stratification*: the researcher approved `_StratifiedRegressionKFold`, which bins continuous y via `pd.qcut` (with `pd.cut` fallback for tied values) and delegates to `StratifiedKFold`.
+
+**Test metrics:**
+
+- Pre-session: 658 tests across 17 test files (658 passing, 0 failing).
+- Post-session: 705 tests across 19 test files (705 passing, 0 failing).
+
+**Audit trail references (.aid/reports/):**
+
+- Brainstorm: `boost-shap-gii_brainstorm_20260813_171500.md`
+- Implementation plan: `boost-shap-gii_implement_plan_20260813_183000.md`, `boost-shap-gii_implement_plan_20260813_220028.md`
+- Implementation build: `boost-shap-gii_implement_build_20260813_223500.md`
+- Test report: `boost-shap-gii_test_20260813_231500.md`
+- Clean report: `boost-shap-gii_clean_20260814_014500.md`
+
+---
+
+### Session 2026-08-14 -- CV strategy hardening: cluster bootstrap, fdr_method, and bug fix
+
+**Date:** 2026-08-14
+
+**Session scope:**
+
+- Critical review (CR) of the CV strategy feature from Session 2026-08-13 produced 3 findings routed to brainstorm: population-level SHAP bootstrap should use cluster-aware resampling when group CV is active (cluster bootstrap; Cameron et al. 2008), the hardcoded BH-FDR should be configurable (fdr_method key), and several minor hardening items (Graham 1966 scheduling, cardinality validation, diagnostic warnings).
+- Brainstorm session locked all design decisions and produced 7 action items for implementation.
+- Implementation plan and build (7 changes, C1-C7): cluster bootstrap for group CV strategy with i.i.d. fallback at n < 20 (Ukoumunne et al. 2003) and variable-length list-of-arrays resampling for unequal group sizes (C1); Graham (1966) greedy list scheduling in `_RepeatedGroupKFold` replacing round-robin (C2); `validate_cv_config` cardinality check for n_unique_groups vs cv_folds/inner_cv_folds (C3); redundant splitter recreation removal in train.py (C4); configurable `fdr_method` key with "bh"/"by" values (C5); inner-groups diagnostic warning in `run_optuna_tuning` (C6); `stratify_labels_for_regression` bin-count warning (C7).
+- Test cycle (first pass): 19 new tests in `test_build_20260814.py`, 1 re-expressed test in `test_train.py`. 9 failures identified as product bug: the i.i.d. fallback guard's reassignment of `cluster_ids` to `None` leaked into the microdata deduplication branch, causing a length-mismatch crash when fallback fired.
+- Bug fix implementation: introduced `original_cluster_ids` variable in `_run_bootstrap_pipeline` (captured before the fallback guard), used for the microdata deduplication conditional. Re-expressed the obsolete `test_unequal_cluster_sizes_raises` test (now `test_unequal_cluster_sizes_completes_with_fallback`).
+- Test cycle (verification pass): 1 new test (`TestClusterBootstrapMicrodataNoFallback`, covering the non-fallback branch at N >= 20). Final suite: 725/725 passing across 19 test files.
+- Documentation updates: README.md (Group CV section, cluster bootstrap, fdr_method), INPUT_SPECIFICATION.md (fdr_method config key, cluster bootstrap section, Graham 1966 scheduling, cardinality validation, FDR references).
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for critical review, brainstorm, implementation plan structuring.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction, test execution.
+- Claude Sonnet 5 (Anthropic): used for test design and coordination, code edits under direction, documentation coordination.
+
+LLM tool use carries no claim to scientific credit under project policy. All decisions were made by the researcher prior to any code-generation step.
+
+**Key decisions (researcher-approved):**
+
+- *Cluster bootstrap for group CV*: the researcher approved cluster-aware resampling at the population level (resample entire groups, expand to member rows) when `cv_strategy="group"` is active in non-inference mode. This preserves within-group correlation for correctly calibrated significance tests (Cameron, Gelbach, & Miller, 2008).
+- *i.i.d. fallback threshold at n < 20*: the researcher approved falling back to i.i.d. bootstrap with a RuntimeWarning when the number of unique groups is below 20, following Ukoumunne et al. (2003). Microdata deduplication uses the original cluster structure regardless of fallback status (the K-replication structure is independent of the bootstrap method).
+- *Graham (1966) list scheduling*: the researcher approved replacing round-robin group-to-fold assignment with greedy-in-random-order scheduling to minimize fold-size imbalance under unequal group sizes.
+- *Configurable fdr_method*: the researcher approved exposing the FDR correction method as a config key (`"bh"` for Benjamini-Hochberg, `"by"` for Benjamini-Yekutieli), defaulting to "bh" to preserve backward compatibility.
+- *Variable-length cluster resampling*: the researcher approved storing bootstrap indices as a list of arrays (rather than a fixed 2-D ndarray) to support unequal group sizes without padding or truncation.
+
+**Test metrics:**
+
+- Pre-session: 705 tests across 19 test files (705 passing, 0 failing).
+- Post-session: 725 tests across 19 test files (725 passing, 0 failing).
+
+**Audit trail references (.aid/reports/):**
+
+- Critical review: `boost-shap-gii_cr_20260814_133000.md`
+- Brainstorm: `boost-shap-gii_brainstorm_20260814_135928.md`
+- Implementation plan: `boost-shap-gii_implement_plan_20260814_141500.md`, `boost-shap-gii_implement_plan_20260814_155000.md`
+- Implementation build: `boost-shap-gii_implement_build_20260814_142500.md`, `boost-shap-gii_implement_build_20260814_155500.md`
+- Test reports: `boost-shap-gii_test_20260814_121500.md`, `boost-shap-gii_test_20260814_150500.md`, `boost-shap-gii_test_20260814_160500.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Version 1.4.0 -- 2026-08-14 (CV strategy hardening and cluster bootstrap)
+
+This release adds group-aware cross-validation infrastructure, cluster bootstrap for SHAP significance testing, configurable FDR correction, and a product bug fix.
+
+- **Group CV with Graham (1966) scheduling**: new `_RepeatedGroupKFold` splitter assigns groups to folds via greedy list scheduling (Graham, 1966), minimizing fold-size imbalance under unequal group sizes. A warning is emitted when the max/min fold-size ratio exceeds 2.0. Group-cardinality validation enforces that the number of unique groups is at least `cv_folds` (and at least `inner_cv_folds` when tuning is configured).
+- **Cluster bootstrap for group CV SHAP significance**: when the group CV strategy is active, population-level bootstrap significance testing uses cluster-aware resampling (resample entire groups with replacement, then expand to member rows) to preserve within-group correlation (Cameron, Gelbach, & Miller, 2008). Variable-length bootstrap indices support unequal group sizes.
+- **i.i.d. fallback guard**: when the number of unique groups is below 20, cluster bootstrap falls back to i.i.d. resampling with a `RuntimeWarning` (Ukoumunne, Gulliford, Chinn, Sterne, & Burney, 2003).
+- **Configurable FDR correction method**: new `shap.bootstrapping.fdr_method` config key supports `"bh"` (Benjamini-Hochberg, 1995; default) and `"by"` (Benjamini-Yekutieli, 2001) for multiple-comparison correction.
+- **`original_cluster_ids` bug fix**: the i.i.d. fallback guard previously overwrote `cluster_ids` to `None`, which caused the microdata deduplication branch to skip group-averaging on K-replicated inference data. The fix captures `original_cluster_ids` before the fallback guard; microdata deduplication uses the original value since K-replication structure is independent of bootstrap method.
+- **Documentation**: README.md and INPUT_SPECIFICATION.md updated with cluster bootstrap, fdr_method, Graham scheduling, and cardinality validation documentation.
+- **Tests**: 67 new tests across 4 test files; 1 re-expressed test (strengthened postcondition). Post-session: 725/725 passing.
+
+---
 
 ### Version 1.3.0 -- 2026-08-12 (aggregate SHAP feature and post-release maintenance)
 

@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import (
     r2_score, mean_squared_error, mean_absolute_error,
     roc_auc_score, accuracy_score,
@@ -36,6 +35,7 @@ from .utils import (
     get_cv_splitter,
     get_scoring_function,
     fill_config_defaults,
+    validate_cv_config,
 )
 
 # Suppress noisy warnings
@@ -480,6 +480,7 @@ def run_optuna_tuning(
     config: Dict,
     n_jobs: int,
     fold_idx: int = 0,
+    groups: np.ndarray = None,
 ) -> Tuple[Dict[str, Any], int]:
     """Run Optuna TPE hyperparameter tuning on the inner CV.
 
@@ -525,14 +526,37 @@ def run_optuna_tuning(
     # Define Inner CV
     inner_cv_folds = tuning_cfg["inner_cv_folds"]
     seed = config["execution"]["random_seed"]
+    n_inner_repeats = int(config["modeling"]["tuning"].get("n_inner_repeats", 1))
 
-    # Offset inner CV seed by fold_idx + 1 so inner and outer folds use distinct seeds.
     inner_seed = seed + fold_idx + 1
-    inner_cv = KFold(n_splits=inner_cv_folds, shuffle=True, random_state=inner_seed)
-    # For stratified splitting, need 1D y with limited unique values
     y_for_stratify = y_train if isinstance(y_train, pd.Series) else y_train.iloc[:, 0]
-    if is_classification(task) and y_for_stratify.nunique() < 20:
-        inner_cv = StratifiedKFold(n_splits=inner_cv_folds, shuffle=True, random_state=inner_seed)
+
+    cv_strategy = config["modeling"].get("cv_strategy", "uniform")
+
+    inner_cv = get_cv_splitter(
+        config, y_for_stratify, seed_override=inner_seed,
+        groups=groups, n_repeats=n_inner_repeats,
+        n_folds_override=inner_cv_folds,
+    )
+
+    if groups is not None and cv_strategy == "group":
+        n_unique_inner = len(np.unique(groups))
+        if n_unique_inner < 2 * inner_cv_folds:
+            print(
+                f"[WARNING] Inner CV has only {n_unique_inner} unique groups for "
+                f"{inner_cv_folds} folds. Some folds may have very few groups, "
+                f"producing unreliable tuning estimates."
+            )
+
+    if n_inner_repeats > 10:
+        print("[WARNING] n_inner_repeats > 10: diminishing returns expected "
+              "(Vanwinckelen & Blockeel 2012).")
+
+    total_inner_fits = inner_cv_folds * n_inner_repeats * n_trials
+    if total_inner_fits > 5000:
+        print(f"[WARNING] Total inner fits per outer fold = {total_inner_fits} "
+              f"({inner_cv_folds} folds x {n_inner_repeats} repeats x "
+              f"{n_trials} trials). Consider reducing n_inner_repeats or n_iter.")
 
     def objective(trial):
         # 1. Parse YAML Search Space dynamically
@@ -677,6 +701,7 @@ def main():
     n_rows = len(df_raw)
     n_features = len(final_cols)
     config, filled_defaults = fill_config_defaults(config, n_rows, n_features)
+    validate_cv_config(config, df=df_raw)
 
     if filled_defaults:
         print(f"[INFO] Auto-filled {len(filled_defaults)} config defaults:")
@@ -708,6 +733,18 @@ def main():
 
     # 3d. Validate aggregate_shap config against resolved feature set
     _validate_aggregate_shap(config, final_cols, nom_feats)
+
+    cv_strategy = config["modeling"].get("cv_strategy", "uniform")
+    group_column = config["modeling"].get("group_column")
+    groups = None
+    if cv_strategy == "group":
+        if group_column in final_cols:
+            final_cols = [c for c in final_cols if c != group_column]
+            con_feats = [c for c in con_feats if c != group_column]
+            ord_feats = [c for c in ord_feats if c != group_column]
+            nom_feats = [c for c in nom_feats if c != group_column]
+            print(f"[INFO] group_column '{group_column}' excluded from feature candidates.")
+        groups = df_raw[group_column].values
 
     # 4. Type Enforcement & Preprocessing
     X = df_raw[final_cols].copy()
@@ -863,7 +900,14 @@ def main():
     # 5. Nested Cross-Validation Loop
     # For multi_regression, get_cv_splitter needs a 1D Series — use first target
     y_for_split = y if isinstance(y, pd.Series) else y.iloc[:, 0]
-    splitter = get_cv_splitter(config, y_for_split)
+    splitter = get_cv_splitter(config, y_for_split, groups=groups)
+
+    if cv_strategy == "group":
+        fold_sizes = [len(val) for _, val in splitter.split(X, y_for_split)]
+        ratio = max(fold_sizes) / max(min(fold_sizes), 1)
+        if ratio > 2.0:
+            print(f"[WARNING] GroupKFold folds are unbalanced: sizes {fold_sizes}. "
+                  f"Max/min ratio = {ratio:.2f} (threshold: 2.0).")
 
     # OOF storage depends on task type
     if task == "multiclass_classification":
@@ -880,6 +924,7 @@ def main():
         oof_preds = pd.Series(index=X.index, dtype=float)
 
     fold_metrics = []
+    fold_assignments = np.full(len(X), -1, dtype=int)
 
     print(f"[INFO] Starting {splitter.get_n_splits()}-Fold Nested CV...")
 
@@ -887,6 +932,7 @@ def main():
         print(f"\n--- Fold {fold_idx + 1} ---")
 
         X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        fold_assignments[val_idx] = fold_idx
         y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
         # --- PHASE 1: CLEAN TRAINING ---
@@ -894,7 +940,8 @@ def main():
         print("  > Tuning hyperparameters (Phase 1: Clean)...")
         # Note: CatBoost handles Ordinals as numeric if we don't list them in cat_features.
         # We ONLY pass nominals to cat_features argument.
-        best_params, tuned_iters = run_optuna_tuning(X_train, y_train, nom_feats, task, config, n_jobs, fold_idx=fold_idx)
+        inner_groups = groups[train_idx] if groups is not None else None
+        best_params, tuned_iters = run_optuna_tuning(X_train, y_train, nom_feats, task, config, n_jobs, fold_idx=fold_idx, groups=inner_groups)
         print(f"  > Best Params: {best_params}")
         print(f"  > Tuned Iterations (inner CV mean): {tuned_iters}")
 
@@ -1035,6 +1082,7 @@ def main():
 
     # 6. Finalize
     print("\n[INFO] CV Complete. Saving Global Artifacts...")
+    save_json_atomic(fold_assignments.tolist(), os.path.join(run_dir, "fold_assignments.json"))
 
     # We include ID if available in raw, else just index
     id_col = "id" if "id" in df_raw.columns else "index"

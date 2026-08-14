@@ -191,4 +191,28 @@ See `INPUT_SPECIFICATION.md` Section 10 for the full algorithmic description, CI
 
 ---
 
+## Cross-Validation Strategy
+
+The pipeline supports three CV strategies via `modeling.cv_strategy`:
+
+| Value | Splitter | Description |
+|---|---|---|
+| `"uniform"` (default) | `KFold` | Standard K-fold, task-type-independent. |
+| `"stratified"` | `StratifiedKFold` / quantile-binned `StratifiedKFold` | Preserves class proportions (classification) or outcome quantile distribution (regression) across folds. |
+| `"group"` | `GroupKFold` | Ensures all observations sharing a group label remain in the same fold. Requires `modeling.group_column`. |
+
+### Group CV
+
+When `cv_strategy: "group"`, set `modeling.group_column` to the column name containing group labels (e.g., `"subject_id"`). The group column is automatically excluded from the feature candidate set. Groups are assigned to folds via greedy scheduling (Graham, 1966), which minimizes fold-size imbalance under unequal group sizes; a warning is emitted when the max/min fold-size ratio exceeds 2.0. The number of unique groups must be at least `cv_folds` (and at least `inner_cv_folds` when tuning is configured).
+
+**SHAP significance testing with group CV**: when the group strategy is active, population-level bootstrap significance testing uses cluster-aware resampling (resample entire groups with replacement, then expand to member rows). This preserves within-group correlation in bootstrap resamples, producing correctly calibrated confidence intervals (Cameron, Gelbach, & Miller, 2008). When the number of unique groups is below 20, cluster bootstrap falls back to i.i.d. resampling with a `RuntimeWarning` (Ukoumunne, Gulliford, Chinn, Sterne, & Burney, 2003). During per-individual bootstrap-of-CV inference, group structure cannot be preserved in bootstrap inner splits, so they fall back to plain `KFold`.
+
+**FDR correction method**: the default multiple-comparison correction is Benjamini-Hochberg FDR (`shap.bootstrapping.fdr_method: "bh"`). Set to `"by"` for Benjamini-Yekutieli FDR when test statistics are positively dependent.
+
+### Inner CV Repeats
+
+Set `modeling.tuning.n_inner_repeats` (default `1`) to average inner CV scores across multiple repetitions per Optuna trial, reducing tuning variance at the cost of additional computation. A warning is emitted when `n_inner_repeats > 10` or when total inner fits exceed 5000.
+
+---
+
 See `INPUT_SPECIFICATION.md` for exhaustive technical details, data schemas, and mathematical formulas.

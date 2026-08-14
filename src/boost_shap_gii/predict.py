@@ -24,7 +24,6 @@ from .utils import (
     detect_task,
     is_classification,
     is_regression,
-    get_cv_splitter,
     get_scoring_function,
     compute_bootstrap_ci,
     compute_permutation_test,
@@ -232,21 +231,23 @@ def main():
 
     counts = np.zeros(len(X))
 
-    # Replicate Splitter from train.py
-    y_for_split = y if isinstance(y, pd.Series) else y.iloc[:, 0]
-    splitter = get_cv_splitter(config, y_for_split)
+    # Load authoritative fold assignments from train.py output
+    fold_assignments_path = os.path.join(run_dir, "fold_assignments.json")
+    with open(fold_assignments_path) as f:
+        fold_assignments = np.array(json.load(f))
+    n_folds = int(fold_assignments.max()) + 1
 
-    # Validate model file count against expected CV fold count
-    expected_folds = splitter.get_n_splits()
-    if len(model_files) != expected_folds:
+    # Validate model file count against fold assignments
+    if len(model_files) != n_folds:
         raise AssertionError(
-            f"Found {len(model_files)} model file(s) in {run_dir} but CV splitter "
-            f"expects {expected_folds} fold(s). Re-run train.py or check output_dir."
+            f"Found {len(model_files)} model file(s) in {run_dir} but fold_assignments.json "
+            f"indicates {n_folds} fold(s). Re-run train.py or check output_dir."
         )
 
     cat_features_indices = nom_feats
 
-    for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(X, y_for_split)):
+    for fold_idx in range(n_folds):
+        val_idx = np.where(fold_assignments == fold_idx)[0]
         model_path = os.path.join(run_dir, f"model_fold_{fold_idx}.cbm")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Missing model file for fold {fold_idx}: {model_path}")
@@ -452,6 +453,12 @@ def main():
         "class_labels": class_labels,
         "target_labels": target_labels,
     }
+
+    cv_strategy = config["modeling"].get("cv_strategy", "uniform")
+    group_column = config["modeling"].get("group_column")
+    if cv_strategy == "group" and group_column is not None and group_column in df_raw.columns:
+        shap_ctx["groups"] = df_raw[group_column].values
+        shap_ctx["cv_strategy"] = cv_strategy
 
     run_shap_pipeline(shap_ctx)
 

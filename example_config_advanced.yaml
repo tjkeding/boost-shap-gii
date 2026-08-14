@@ -58,46 +58,17 @@ features:
 modeling:
   outcome: "outcome_total"    # String for single outcome; list for multi_regression (e.g., ["y1", "y2"])
   cv_folds: 10
+  cv_strategy: "uniform"         # CV splitter: "uniform" (KFold), "stratified" (StratifiedKFold), or "group" (GroupKFold)
+  # group_column: "subject_id"   # Required when cv_strategy: "group"; names the grouping column
 
-  # Task type (optional — auto-detected from scoring if omitted)
-  # Options: "regression", "binary_classification", "multiclass_classification", "multi_regression"
-  # task_type: "regression"
-
-  # Optimization metric for TRAINING
-  # Regression options: "RMSE", "MAE", "Huber:delta=VALUE", "Quantile"
-  # Multi-regression option: "MultiRMSE"
-  # Binary classification options: "Logloss", "CrossEntropy"
-  # Multiclass classification options: "MultiClass", "MultiClassOneVsAll"
-  #
-  # When to use Huber loss (regression / multi_regression only):
-  #   Huber loss replaces L2 (squared) residuals with L1 (absolute) residuals beyond
-  #   a threshold delta, capping the influence of outliers on gradient updates.
-  #   Consider Huber when the outcome is:
-  #     - Zero-inflated (>= 15% zeros)
-  #     - Right-skewed (skewness >= 2.0)
-  #     - Heavy-tailed (excess kurtosis >= 5.0)
-  #   The pipeline emits a WARNING when these conditions are detected.
-  #
-  # MAD-based delta formula (Huber, 1981; Maronna et al., 2006):
-  #   delta = 1.345 * 1.4826 * MAD(y)
-  #   where MAD(y) = median(|y - median(y)|)
-  #     k = 1.345  -> 95% asymptotic relative efficiency at the normal model
-  #     1.4826     -> MAD consistency factor: 1 / Phi^{-1}(3/4)
-  #   Example: if MAD(y) = 2.5, then delta = 1.345 * 1.4826 * 2.5 = 4.985
-  #   CatBoost syntax: "Huber:delta=4.9850"
-  #
-  # See INPUT_SPECIFICATION.md Section 9 for the full derivation.
-  loss_function: "RMSE"
+  # task_type: "regression"      # Optional: regression, binary_classification, multiclass_classification, multi_regression
+  loss_function: "RMSE"          # Training loss: RMSE, MAE, Huber:delta=VALUE, MultiRMSE, Logloss, MultiClass
 
   tuning:
     n_iter: 500
-
-    # Optimization metric for TUNING
-    # Regression options: "neg_rmse", "neg_mae", "r2"
-    # Binary classification options: "roc_auc", "log_loss", "accuracy", "f1"
-    # Multiclass classification options: "balanced_accuracy", "f1_weighted", "roc_auc_ovr"
-    scoring: "neg_rmse"
+    scoring: "neg_rmse"          # Tuning metric: neg_rmse, neg_mae, r2, roc_auc, balanced_accuracy, f1_weighted
     inner_cv_folds: 5
+    n_inner_repeats: 1           # Averaged inner CV repeats per Optuna trial (1 = no repeats)
     early_stopping_rounds: 250
 
     search_space:
@@ -143,6 +114,7 @@ shap:
     n_boot: 10000         # Number of bootstrap iterations
     alpha: 0.05           # Significance level (for CIs and FDR)
     fdr_correct: true     # Use FDR corrected q (instead of p) for significance testing
+    fdr_method: "bh"      # FDR correction method: "bh" (Benjamini-Hochberg) or "by" (Benjamini-Yekutieli)
     stab_thresh: 2        # Significance level for stability (2 = twice as much signal as noise)
     output_boots_n: 25    # Extra non-significant features to save bootstraps for
 
@@ -152,56 +124,24 @@ shap:
     discrete_threshold: 15  # Must satisfy: discrete_threshold >= n_knots + degree + 2 (Wood 2017 GAM ch. 4)
 
   # Per-individual SHAP CI and scaling configuration
-  indiv_ci_nboot: 2500
-    # Number of coupled bootstrap iterations for per-individual SHAP CIs. 0 disables the feature.
-    # When enabled, minimum recommended 2500 (inference CIs Efron-tier, training OOB CIs near-Efron).
-    # Peer-review-facing runs: 5000 (both sides Efron-tier). Values below 2500 permitted but produce
-    # training OOB CIs only at Carpenter-Bithell 2000 minimum tier. Per iteration, K fold refits are
-    # performed on a shared bootstrap sample; total refits executed = K x B. Embarrassingly parallel.
-
-  indiv_scaling_mode: "sd"
-    # Scaling mode for per-individual SHAP values in indiv_reports output.
-    # raw = unscaled SHAP values; sd = divide by SD of training outcome (regression only);
-    # custom_value = divide by shap.indiv_scaling_value.
-
-  indiv_scaling_value: 1.0
-    # Divisor used when indiv_scaling_mode=custom_value (e.g., outcome theoretical maximum, MCID,
-    # clinically meaningful anchor). Must be > 0. Ignored when indiv_scaling_mode != custom_value.
-
-  compute_global_on_inference: false
-    # When true, infer.py also emits shap_analysis/ population-level GII on the inference dataset
-    # (distribution-shift diagnostic at large N). Default false because small-N inference sets
-    # produce degenerate GII.
+  indiv_ci_nboot: 2500           # Coupled bootstrap iterations for per-individual SHAP CIs (0 disables)
+  indiv_scaling_mode: "sd"       # Scaling: "raw", "sd" (regression only), or "custom_value"
+  indiv_scaling_value: 1.0       # Divisor when indiv_scaling_mode="custom_value"; must be > 0
+  compute_global_on_inference: false  # If true, infer.py emits population-level GII on inference data
 
 # aggregate_shap:
-#   # Post-hoc group-level SHAP analysis. Sums individual SHAP values
-#   # within user-defined groups to compute group-level M, V, and GII.
-#   # Each feature may belong to at most one group. Nominal features
-#   # are not permitted. Groups receive shadow-calibrated significance
-#   # testing via block-permuted Boruta exceedance.
-#   #
-#   # subscale_A_total:
-#   #   - "subscale_A_item1"
-#   #   - "subscale_A_item2"
-#   #   - "subscale_A_item3"
-#   # subscale_B_total:
-#   #   - "subscale_B_item1"
-#   #   - "subscale_B_item2"
+#   subscale_A_total:              # Group name (must not collide with a feature name)
+#     - "subscale_A_item1"         # Constituent features (disjoint, no nominals)
+#     - "subscale_A_item2"
+#     - "subscale_A_item3"
+#   subscale_B_total:
+#     - "subscale_B_item1"
+#     - "subscale_B_item2"
 
 plot:
-  outcome_max: 100.0
-    # Theoretical maximum value of the outcome (used to scale GII magnitudes on plots).
-    # Renamed from the prior outcome_range CLI arg.
-
-  negate_shap: false  # ONLY affects plot.R rendering
-    # If true, SHAP y-axis values are sign-flipped on GII and indiv plots.
-    # Color gradient and x-axis ordering remain anchored to raw signed SHAP.
-
+  outcome_max: 100.0             # Theoretical maximum of the outcome (scales GII plot magnitudes)
+  negate_shap: false             # If true, sign-flip SHAP y-axis values on plots
   gii_y_label: "Global Importance Index (GII)"
-    # Label strings rendered verbatim on plots (no programmatic composition, no individual-ID
-    # substitution, no auto-appended CI annotation). No plot titles are emitted anywhere in
-    # the pipeline.
-
   gii_y_sublabel: "SHAP-based feature importance"
 
   indiv_y_label: "SHAP Value (scaled)"

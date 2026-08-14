@@ -58,7 +58,7 @@ from scipy import stats
 from statsmodels.stats.multitest import multipletests
 from joblib import Parallel, delayed
 
-from .utils import get_cv_splitter, detect_task, is_regression, _block_permute_shadow
+from .utils import detect_task, is_regression, _block_permute_shadow
 
 # -----------------------------------------------------------------------------
 # 1. IO & Helpers
@@ -711,7 +711,7 @@ def _aggregate_effects(
 # -----------------------------------------------------------------------------
 
 def _bootstrap_worker_chunk(
-    indices_chunk: np.ndarray,
+    indices_chunk,
     X_vals: np.ndarray,
     SHAP_vals: np.ndarray,
     effect_indices: List[Tuple[int, int]],
@@ -746,7 +746,10 @@ def _bootstrap_worker_chunk(
 
     Returns (chunk_mag, chunk_var, chunk_gii), each shaped (n_iter, n_effects).
     """
-    n_iter, n_samples = indices_chunk.shape
+    if isinstance(indices_chunk, list):
+        n_iter = len(indices_chunk)
+    else:
+        n_iter = indices_chunk.shape[0]
     n_effects = SHAP_vals.shape[1]
 
     chunk_mag = np.zeros((n_iter, n_effects), dtype=np.float32)
@@ -974,6 +977,8 @@ def _run_bootstrap_pipeline(
     n_boot = config["shap"]["bootstrapping"]["n_boot"]
     alpha = config["shap"]["bootstrapping"]["alpha"]
     fdr_correct = bool(config["shap"]["bootstrapping"]["fdr_correct"])
+    fdr_method_key = config["shap"]["bootstrapping"].get("fdr_method", "bh")
+    fdr_method_scipy = "fdr_bh" if fdr_method_key == "bh" else "fdr_by"
     output_boots_n = config["shap"]["bootstrapping"]["output_boots_n"]
     output_micro_n = config["shap"]["output_microdata_n"]
     spline_cfg = config["shap"]["splines"]
@@ -986,34 +991,51 @@ def _run_bootstrap_pipeline(
     # 1. Bootstrap Execution (Real)
     rng = np.random.default_rng(seed)
 
+    original_cluster_ids = cluster_ids
+
     if cluster_ids is not None:
-        # Cluster-aware bootstrap: resample at observation level, expand to
-        # all K rows per cluster.  This preserves fold-to-fold variation
-        # within each observation and produces correct CIs.
+        unique_clusters = np.unique(cluster_ids)
+        n_clusters = len(unique_clusters)
+
+        _CLUSTER_BOOTSTRAP_MIN_GROUPS = 20
+
+        if n_clusters < _CLUSTER_BOOTSTRAP_MIN_GROUPS:
+            warnings.warn(
+                f"Only {n_clusters} unique groups detected (minimum "
+                f"{_CLUSTER_BOOTSTRAP_MIN_GROUPS} recommended for reliable "
+                f"cluster bootstrap; Ukoumunne et al. 2003). Falling back to "
+                f"i.i.d. bootstrap. SHAP significance calls may be "
+                f"anti-conservative under within-group correlation.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            cluster_ids = None
+
+    if cluster_ids is not None:
         unique_clusters = np.unique(cluster_ids)
         n_clusters = len(unique_clusters)
         cluster_to_rows: Dict[Any, np.ndarray] = {}
         for cid in unique_clusters:
             cluster_to_rows[cid] = np.where(cluster_ids == cid)[0]
-        cluster_sizes = np.array([len(cluster_to_rows[c]) for c in unique_clusters])
-        assert np.all(cluster_sizes == cluster_sizes[0]), (
-            f"Cluster bootstrap requires equal cluster sizes (K folds per obs), "
-            f"but found sizes {np.unique(cluster_sizes)}"
-        )
-        rows_per_cluster = cluster_sizes[0]
-        # For each bootstrap iteration, sample N cluster IDs with replacement,
-        # then expand to all K rows per cluster → K*N rows per resample.
+
+        all_indices = []
         sampled_cluster_idx = rng.integers(0, n_clusters, size=(n_boot, n_clusters))
-        all_indices = np.empty((n_boot, n_clusters * rows_per_cluster), dtype=np.intp)
         for b in range(n_boot):
             expanded = np.concatenate(
                 [cluster_to_rows[unique_clusters[c]] for c in sampled_cluster_idx[b]]
             )
-            all_indices[b] = expanded
+            all_indices.append(expanded)
     else:
         all_indices = rng.integers(0, n_samples, size=(n_boot, n_samples))
 
-    indices_split = np.array_split(all_indices, max(1, n_jobs))
+    n_split = max(1, n_jobs)
+    if isinstance(all_indices, list):
+        chunk_size = (len(all_indices) + n_split - 1) // n_split
+        indices_split = [all_indices[i * chunk_size:(i + 1) * chunk_size]
+                         for i in range(n_split)]
+        indices_split = [c for c in indices_split if c]
+    else:
+        indices_split = np.array_split(all_indices, n_split)
 
     print(f"[SHAP] Bootstrapping {n_features} Real effects (B={n_boot})...")
 
@@ -1166,15 +1188,16 @@ def _run_bootstrap_pipeline(
     # input p-value is NaN. Mask NaN→1.0 (conservative: "not significant"), run
     # correction, then restore NaN for affected positions.
     def _nan_safe_fdr(p_vals, alpha_val):
-        """Apply BH-FDR correction to a pooled p-value vector with NaN pass-through.
+        """Apply FDR correction to a pooled p-value vector with NaN pass-through.
 
         Applied to the pooled set of all effects (singletons + interactions across
         all noise strata). NaN p-values (from failed calculations) are replaced with
-        1.0 conservative placeholders that remain in the BH denominator, inflating m
+        1.0 conservative placeholders that remain in the denominator, inflating m
         and making the correction slightly more conservative for non-NaN effects.
         After correction, NaN entries are restored as NaN q-values.
         No cross-family correction is applied between sig_M, sig_V, and sig_GII;
-        each family receives an independent BH call.
+        each family receives an independent FDR call. The correction method is set
+        by config (fdr_method_scipy captured from enclosing scope).
 
         Parameters
         ----------
@@ -1186,16 +1209,16 @@ def _run_bootstrap_pipeline(
         Returns
         -------
         np.ndarray
-            BH-adjusted q-values; NaN where p_vals was NaN.
+            FDR-adjusted q-values; NaN where p_vals was NaN.
         """
         nan_mask_p = np.isnan(p_vals)
         if nan_mask_p.any():
             p_clean = p_vals.copy()
             p_clean[nan_mask_p] = 1.0  # conservative placeholder
-            q_vals = multipletests(p_clean, alpha=alpha_val, method='fdr_bh')[1]
+            q_vals = multipletests(p_clean, alpha=alpha_val, method=fdr_method_scipy)[1]
             q_vals[nan_mask_p] = np.nan  # restore NaN for failed effects
             return q_vals
-        return multipletests(p_vals, alpha=alpha_val, method='fdr_bh')[1]
+        return multipletests(p_vals, alpha=alpha_val, method=fdr_method_scipy)[1]
 
     # Three independent BH-FDR calls — one per family (sig_M, sig_V, sig_GII).
     # Each call receives the FULL pooled p-value vector across ALL real effects
@@ -1273,9 +1296,9 @@ def _run_bootstrap_pipeline(
     # When cluster_ids is present (inference mode), microdata should show one row
     # per observation (averaged across K folds), not K duplicates.
     print(f"[SHAP] Saving Microdata Parquets (Top {output_micro_n} extra)...")
-    if cluster_ids is not None:
+    if original_cluster_ids is not None:
         df_shap_micro = df_shap.copy()
-        df_shap_micro.index = cluster_ids
+        df_shap_micro.index = original_cluster_ids
         df_shap_micro = df_shap_micro.groupby(level=0).mean()
         if X_display is not None:
             missing = [c for c in real_feature_names if c not in X_display.columns]
@@ -1313,6 +1336,8 @@ def _run_shap_for_slice(
     slice_idx: Optional[int] = None,
     slice_label: Optional[str] = None,
     inference_mode: bool = False,
+    groups: Optional[np.ndarray] = None,
+    cv_strategy: str = "uniform",
 ) -> None:
     """Run the full SHAP pipeline for a single class/target slice (or the whole model).
 
@@ -1422,6 +1447,9 @@ def _run_shap_for_slice(
         _to_parquet_atomic(df_shap_real, os.path.join(shap_dir, "real_shap_interaction_matrix.parquet"))
         _to_parquet_atomic(df_shap_shadow, os.path.join(shap_dir, "shadow_shap_interaction_matrix.parquet"))
 
+        if cv_strategy == "group" and groups is not None:
+            cluster_ids = groups
+
     # Aggregate SHAP effects per aggregate_shap config (no-op when key is absent)
     (df_shap_real, df_shap_shadow, X_stacked,
      meta_real, meta_shadow_all, all_feature_types) = _aggregate_effects(
@@ -1495,6 +1523,8 @@ def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
     class_labels = ctx.get("class_labels", None)
     target_labels = ctx.get("target_labels", None)
     inference_mode = ctx.get("inference_mode", False)
+    groups = ctx.get("groups", None)
+    cv_strategy = ctx.get("cv_strategy", "uniform")
 
     train_dir = ctx.get("train_dir", run_dir)
     shadow_paths = _discover_shadow_models(train_dir)
@@ -1507,9 +1537,15 @@ def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
         # In inference mode, every fold uses the full dataset
         splits = [(None, np.arange(len(X_aligned)))] * len(shadow_paths)
     elif y is not None:
-        y_for_split = y if isinstance(y, pd.Series) else y.iloc[:, 0]
-        splitter = get_cv_splitter(config, y_for_split)
-        splits = list(splitter.split(X_aligned, y_for_split))
+        fold_assignments_path = os.path.join(train_dir, "fold_assignments.json")
+        with open(fold_assignments_path) as f:
+            fold_assignments = np.array(json.load(f))
+        n_folds = int(fold_assignments.max()) + 1
+        splits = []
+        for k in range(n_folds):
+            val_idx = np.where(fold_assignments == k)[0]
+            train_idx = np.where(fold_assignments != k)[0]
+            splits.append((train_idx, val_idx))
     else:
         splits = [(None, np.arange(len(X_aligned)))] * len(shadow_paths)
 
@@ -1539,6 +1575,8 @@ def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
             ctx, shap_dir, shadow_paths, splits,
             all_feature_types, slice_idx, slice_label,
             inference_mode=inference_mode,
+            groups=groups,
+            cv_strategy=cv_strategy,
         )
 
     print(f"[SUCCESS] SHAP Analysis Complete. Outputs in {run_dir}")

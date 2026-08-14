@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, RepeatedKFold, RepeatedStratifiedKFold
 from sklearn.metrics import (
     r2_score, mean_squared_error, mean_absolute_error,
     roc_auc_score, log_loss, accuracy_score, f1_score,
@@ -160,19 +160,129 @@ def is_regression(task: str) -> bool:
     return task in ("regression", "multi_regression")
 
 
-def get_cv_splitter(config: Dict, y: pd.Series):
-    """Return a KFold or StratifiedKFold splitter based on task."""
-    n_folds = int(config["modeling"]["cv_folds"])
-    seed = int(config["execution"]["random_seed"])
-    task = detect_task(config)
+def stratify_labels_for_regression(y: pd.Series, n_bins: int) -> pd.Series:
+    try:
+        result = pd.qcut(y, q=n_bins, labels=False, duplicates='drop')
+    except ValueError:
+        result = pd.cut(y, bins=n_bins, labels=False)
+    actual_bins = int(result.nunique())
+    if actual_bins < n_bins:
+        print(
+            f"[WARNING] Stratification produced {actual_bins} bins instead of "
+            f"the requested {n_bins} (likely due to tied outcome values)."
+        )
+    return result
 
-    if is_regression(task):
-        return KFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    else:
-        if y.nunique() < 20:
-            return StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+
+class _StratifiedRegressionKFold:
+    def __init__(self, n_splits, random_state, n_repeats=1):
+        self.n_splits = n_splits
+        self.n_repeats = n_repeats
+        if n_repeats > 1:
+            self._inner = RepeatedStratifiedKFold(
+                n_splits=n_splits, n_repeats=n_repeats, random_state=random_state
+            )
         else:
-            return KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+            self._inner = StratifiedKFold(
+                n_splits=n_splits, shuffle=True, random_state=random_state
+            )
+
+    def split(self, X, y=None, groups=None):
+        y_binned = stratify_labels_for_regression(y, self.n_splits)
+        yield from self._inner.split(X, y_binned)
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self._inner.get_n_splits()
+
+
+class _GroupKFoldWrapper:
+    def __init__(self, n_splits, groups):
+        self._inner = GroupKFold(n_splits=n_splits)
+        self.groups = groups
+        self.n_splits = n_splits
+
+    def split(self, X, y=None, groups=None):
+        yield from self._inner.split(X, y, groups=self.groups)
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits
+
+
+class _RepeatedGroupKFold:
+    def __init__(self, n_splits, n_repeats, groups, random_state):
+        self.n_splits = n_splits
+        self.n_repeats = n_repeats
+        self.groups = groups
+        self.random_state = random_state
+
+    def split(self, X, y=None, groups=None):
+        for rep in range(self.n_repeats):
+            rng = np.random.default_rng(self.random_state + rep)
+            unique_groups = np.unique(self.groups)
+            perm = rng.permutation(unique_groups)
+
+            group_sizes = {g: int(np.sum(self.groups == g)) for g in unique_groups}
+            fold_loads = np.zeros(self.n_splits, dtype=np.int64)
+            group_to_fold = {}
+            for g in perm:
+                lightest = int(np.argmin(fold_loads))
+                group_to_fold[g] = lightest
+                fold_loads[lightest] += group_sizes[g]
+
+            if fold_loads.min() > 0:
+                ratio = fold_loads.max() / fold_loads.min()
+                if ratio > 2.0:
+                    print(
+                        f"[WARNING] _RepeatedGroupKFold repeat {rep}: fold sizes "
+                        f"{fold_loads.tolist()} are unbalanced (max/min ratio = "
+                        f"{ratio:.2f}, threshold: 2.0)."
+                    )
+
+            fold_labels = np.array([group_to_fold[g] for g in self.groups])
+            for k in range(self.n_splits):
+                train_idx = np.where(fold_labels != k)[0]
+                val_idx = np.where(fold_labels == k)[0]
+                yield train_idx, val_idx
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return self.n_splits * self.n_repeats
+
+
+def get_cv_splitter(
+    config: Dict,
+    y: pd.Series,
+    seed_override: int = None,
+    groups=None,
+    n_repeats: int = 1,
+    n_folds_override: int = None,
+):
+    n_folds = n_folds_override if n_folds_override is not None else int(config["modeling"]["cv_folds"])
+    seed = seed_override if seed_override is not None else int(config["execution"]["random_seed"])
+    task = detect_task(config)
+    cv_strategy = config["modeling"].get("cv_strategy", "uniform")
+
+    if cv_strategy == "uniform":
+        if n_repeats > 1:
+            return RepeatedKFold(n_splits=n_folds, n_repeats=n_repeats, random_state=seed)
+        return KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    elif cv_strategy == "stratified":
+        if is_regression(task):
+            return _StratifiedRegressionKFold(n_splits=n_folds, random_state=seed, n_repeats=n_repeats)
+        else:
+            if n_repeats > 1:
+                return RepeatedStratifiedKFold(n_splits=n_folds, n_repeats=n_repeats, random_state=seed)
+            return StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    elif cv_strategy == "group":
+        if groups is None:
+            raise ValueError(
+                "cv_strategy='group' requires groups parameter. "
+                "Ensure config['modeling']['group_column'] is set and the column is present in the data."
+            )
+        if n_repeats > 1:
+            return _RepeatedGroupKFold(n_splits=n_folds, n_repeats=n_repeats, groups=groups, random_state=seed)
+        return _GroupKFoldWrapper(n_splits=n_folds, groups=groups)
+    else:
+        raise ValueError(f"Unknown cv_strategy: '{cv_strategy}'. Must be 'uniform', 'stratified', or 'group'.")
 
 
 def get_scoring_function(metric_name: str):
@@ -332,6 +442,8 @@ def fill_config_defaults(
     # -- execution --
     _set(["execution", "n_jobs"], os.cpu_count(), f"{os.cpu_count()} (auto-detected CPUs)")
     _set(["execution", "random_seed"], 42)
+    _set(["modeling", "cv_strategy"], "uniform")
+    _set(["modeling", "tuning", "n_inner_repeats"], 1)
 
     # -- modeling.task_type (needed for loss/scoring inference) --
     if "task_type" not in config.get("modeling", {}):
@@ -370,6 +482,7 @@ def fill_config_defaults(
     _set(["shap", "bootstrapping", "n_boot"], n_boot, f"{n_boot} (n={n_rows})")
     _set(["shap", "bootstrapping", "alpha"], 0.05)
     _set(["shap", "bootstrapping", "fdr_correct"], True)
+    _set(["shap", "bootstrapping", "fdr_method"], "bh")
     _set(["shap", "bootstrapping", "stab_thresh"], 2)
     _set(["shap", "bootstrapping", "output_boots_n"], 10)
 
@@ -421,6 +534,59 @@ def validate_spline_config(config: dict) -> None:
             f">= n_knots + degree + 2 ({n_knots} + {degree} + 2 = {lower_bound}). "
             f"Spline basis is rank-deficient below this lower bound (Wood 2017, "
             f"Generalized Additive Models, ch. 4)."
+        )
+
+
+def validate_cv_config(config: dict, df: pd.DataFrame = None) -> None:
+    cv_strategy = config["modeling"].get("cv_strategy", "uniform")
+    valid_strategies = {"uniform", "stratified", "group"}
+    if cv_strategy not in valid_strategies:
+        raise ValueError(
+            f"modeling.cv_strategy must be one of {sorted(valid_strategies)}, "
+            f"got '{cv_strategy}'."
+        )
+    if cv_strategy == "group":
+        group_column = config["modeling"].get("group_column")
+        if group_column is None:
+            raise ValueError(
+                "modeling.group_column is required when cv_strategy='group' "
+                "but is missing from config."
+            )
+        if df is not None and group_column not in df.columns:
+            raise ValueError(
+                f"modeling.group_column='{group_column}' not found in the input data columns."
+            )
+        if df is not None:
+            n_unique_groups = df[group_column].nunique()
+            cv_folds = config["modeling"].get("cv_folds")
+            if cv_folds is not None and n_unique_groups < cv_folds:
+                raise ValueError(
+                    f"cv_strategy='group' requires at least cv_folds={cv_folds} unique "
+                    f"groups, but group_column='{group_column}' has only "
+                    f"{n_unique_groups} unique values."
+                )
+            inner_cv_folds = config.get("modeling", {}).get("tuning", {}).get("inner_cv_folds")
+            if inner_cv_folds is not None and n_unique_groups < inner_cv_folds:
+                raise ValueError(
+                    f"cv_strategy='group' requires at least inner_cv_folds={inner_cv_folds} "
+                    f"unique groups, but group_column='{group_column}' has only "
+                    f"{n_unique_groups} unique values."
+                )
+    n_inner_repeats = config.get("modeling", {}).get("tuning", {}).get("n_inner_repeats", 1)
+    if not isinstance(n_inner_repeats, int) or n_inner_repeats < 1:
+        raise ValueError(
+            f"modeling.tuning.n_inner_repeats must be a positive integer, "
+            f"got {n_inner_repeats!r}."
+        )
+
+
+def validate_bootstrap_config(config: dict) -> None:
+    fdr_method = config.get("shap", {}).get("bootstrapping", {}).get("fdr_method", "bh")
+    valid_methods = {"bh", "by"}
+    if fdr_method not in valid_methods:
+        raise ValueError(
+            f"shap.bootstrapping.fdr_method must be one of {sorted(valid_methods)}, "
+            f"got '{fdr_method}'."
         )
 
 

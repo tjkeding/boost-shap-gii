@@ -62,7 +62,7 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
 
 #### Stage 0: Pre-flight (`check_env.py`)
 - **Invocation**: `boost-shap-gii check-env` or `python -m boost_shap_gii.check_env`.
-- **Python Verification**: Imports `catboost`, `optuna`, `shap`, `pyarrow`, `sklearn`, `scipy`,
+- **Python Verification**: Imports `catboost`, `optuna`, `pyarrow`, `sklearn`, `scipy`,
   `pandas`, `yaml`, `joblib`, `statsmodels`.
 - **R Verification**: Checks `ggplot2`, `dplyr`, `nanoparquet`, `tidyr`, `foreach`, `doParallel`,
   `gridExtra`, `stringr`, `yaml`. R is optional; missing R packages produce a warning but
@@ -109,10 +109,13 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
 #### Stage 4: Training (`train.py`)
 
 **Nested Cross-Validation**:
-- Outer CV: `KFold` (regression/multi_regression) or `StratifiedKFold` (classification),
-  seeded with `config.execution.random_seed`.
-- Inner CV (Optuna tuning): same type, seeded with `random_seed + fold_idx + 1` to ensure
-  inner and outer folds use distinct split patterns.
+- Outer CV fold construction is controlled by `modeling.cv_strategy` (default `"uniform"`):
+  - `"uniform"`: `KFold` regardless of task type.
+  - `"stratified"`: `StratifiedKFold` for classification tasks; quantile-binned `StratifiedKFold` for regression (bins continuous y via `pd.qcut` with `pd.cut` fallback for tied values).
+  - `"group"`: `GroupKFold` via the column named by `modeling.group_column`. The group column is automatically excluded from the feature candidate set. Groups are assigned to folds via greedy scheduling (Graham, 1966: each group is assigned to the fold with the fewest total samples in a randomized arrival order), which minimizes fold-size imbalance under unequal group sizes. A warning is emitted when the max/min fold-size ratio exceeds 2.0 (unbalanced group allocation). The number of unique groups must be at least `cv_folds` (and at least `inner_cv_folds` when tuning is configured); otherwise `validate_cv_config` raises `ValueError`.
+- All outer CV splitters are seeded with `config.execution.random_seed`.
+- Inner CV (Optuna tuning): uses the same `cv_strategy` splitter type, seeded with `random_seed + fold_idx + 1`. When `modeling.tuning.n_inner_repeats > 1`, inner CV uses `RepeatedKFold`, `RepeatedStratifiedKFold`, or `_RepeatedGroupKFold` (the latter permutes group-to-fold assignment per repeat with a seeded RNG while preserving group integrity). Inner fold scores are averaged across all repeats before Optuna reports the trial metric.
+- Fold assignments (integer array mapping each training sample to its outer fold index) are persisted as `fold_assignments.json` in the output directory after the outer CV loop completes. This artifact is the authoritative source for fold membership in all downstream consumers (`predict.py`, `shap_utils.py`, `indiv_reports.py`).
 
 **Phase 1 — Clean Model**:
 - Optuna TPE hyperparameter tuning on inner CV folds.
@@ -135,8 +138,8 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
   would bias the noise calibration baseline toward the clean signal.
 
 #### Stage 5: Prediction / Evaluation (`predict.py`)
-- Replicates outer CV splitter from training (same seed and type).
-- Validates that the number of saved model files matches `splitter.get_n_splits()`.
+- Loads `fold_assignments.json` (persisted by `train.py`) to reconstruct per-sample fold membership without re-instantiating a CV splitter.
+- Validates that the number of saved model files matches the fold count derived from the artifact.
   Raises `AssertionError` with a clear message if counts diverge (protects against
   incomplete training runs).
 - Bootstrapped 95% CIs for OOF metrics; permutation test for model vs. chance.
@@ -200,6 +203,8 @@ Feature groups are defined as lists under `continuous_groups`, `ordinal_groups`,
 | `task_type` | str | Auto-inferred | One of: `regression`, `binary_classification`, `multiclass_classification`, `multi_regression`. Inferred from `scoring` if omitted. |
 | `loss_function` | str | Task-dependent | CatBoost loss. Regression: `RMSE`. Binary: `Logloss`. Multiclass: `MultiClass`. Multi-regression: `MultiRMSE`. |
 | `cv_folds` | int | Data-driven | Outer CV folds. Default: 3, 5, or 10 (min 30 obs per val fold). |
+| `cv_strategy` | str | `"uniform"` | CV splitter selector. `"uniform"`: `KFold` regardless of task type. `"stratified"`: `StratifiedKFold` (classification) or quantile-binned `StratifiedKFold` (regression). `"group"`: `GroupKFold` using the column named by `group_column`. |
+| `group_column` | str | None | Column name for group membership; required when `cv_strategy: "group"`. The named column is automatically excluded from feature candidates. |
 
 #### `modeling.tuning`
 | Key | Type | Default | Description |
@@ -208,6 +213,7 @@ Feature groups are defined as lists under `continuous_groups`, `ordinal_groups`,
 | `scoring` | str | Task-dependent | Tuning metric. Regression: `neg_rmse`. Binary: `roc_auc`. Multiclass: `balanced_accuracy`. Multi-regression: `neg_rmse`. |
 | `inner_cv_folds` | int | Data-driven | Inner CV folds (min 20 obs per inner val fold). |
 | `early_stopping_rounds` | int | `250` | CatBoost patience for inner CV and shadow model. |
+| `n_inner_repeats` | int | `1` | Number of inner CV repetitions per Optuna trial. When > 1, fold scores are averaged across repeats before reporting the trial metric. Cost warning emitted when > 10 or when total inner fits exceed 5000. |
 
 #### `modeling.tuning.search_space`
 Each parameter entry is either a list (categorical) or a dict with `low`, `high`, optional `log: true`.
@@ -240,7 +246,8 @@ See Section 10 for the full per-individual CI algorithm, output schema, and inte
 |---|---|---|---|
 | `n_boot` | int | Data-driven | Bootstrap iterations. 2000 (n<100), 5000 (n<500), 10000 (n≥500). |
 | `alpha` | float | `0.05` | Significance level for CIs, exceedance tests, and FDR. |
-| `fdr_correct` | bool | `True` | Apply Benjamini-Hochberg FDR correction to exceedance p-values. |
+| `fdr_correct` | bool | `True` | Apply FDR correction to exceedance p-values. |
+| `fdr_method` | str | `"bh"` | FDR correction method. `"bh"`: Benjamini-Hochberg (1995). `"by"`: Benjamini-Yekutieli (2001), appropriate when test statistics are positively dependent. |
 | `stab_thresh` | float | `2.0` | Minimum stability (median / CI_width) for significance. |
 | `output_boots_n` | int | `10` | Extra non-significant features to save bootstrap distributions for. |
 
@@ -337,16 +344,17 @@ attribution magnitude alone nor trend informativeness alone constitutes
 global importance under the GII framework.
 
 **Significance Criteria (all must hold)**:
-1. `q_exceed_GII < alpha` (BH-FDR-corrected exceedance p-value).
+1. `q_exceed_GII < alpha` (FDR-corrected exceedance p-value; BH or BY per `fdr_method`).
 2. `stab_pctl_GII > stab_thresh` (stability threshold).
 
 Both M and V are independently tested; `sig_M` and `sig_V` are also reported.
 
-**FDR Control**: Three independent Benjamini-Hochberg FDR (BH-FDR; Benjamini &
-Hochberg, 1995) calls are applied — one per component family (M exceedance p-values,
-V exceedance p-values, GII exceedance p-values). Separating the three families into
-independent BH calls prevents cross-component FDR inflation and preserves the ability
-to interpret M and V significance separately from GII significance.
+**FDR Control**: Three independent FDR calls are applied, one per component family
+(M exceedance p-values, V exceedance p-values, GII exceedance p-values). The correction
+method is configurable via `shap.bootstrapping.fdr_method`: `"bh"` (default) uses
+Benjamini-Hochberg (1995); `"by"` uses Benjamini-Yekutieli (2001). Separating the three
+families into independent calls prevents cross-component FDR inflation and preserves the
+ability to interpret M and V significance separately from GII significance.
 
 **Exceedance P-Values**:
 - Computed with the Davison & Hinkley (1997) / Phipson & Smyth (2010) +1 correction:
@@ -467,6 +475,32 @@ method-switching.
   class imbalance with n < 5), `compute_bootstrap_ci` returns `(base_score, NaN, NaN)` and
   emits a `RuntimeWarning`. The point estimate is the metric computed on the full sample; CI
   bounds are undefined. Callers may detect this state by checking for `NaN` CI bounds.
+
+#### Cluster Bootstrap for Group CV Strategy
+
+When `cv_strategy: "group"` is active and the model is in non-inference mode (OOF predict),
+population-level bootstrap significance testing uses cluster-aware resampling: bootstrap
+iterations resample entire groups (clusters) with replacement, then expand to all member
+rows (Cameron, Gelbach, & Miller, 2008; Field & Welsh, 2007). This preserves within-group
+correlation and produces correctly calibrated confidence intervals and p-values.
+
+Variable-length cluster resampling: because group sizes need not be equal, each bootstrap
+iteration produces a sample of potentially different length. Bootstrap indices are stored
+as a list of arrays rather than a fixed 2-D ndarray.
+
+**i.i.d. fallback**: when the number of unique groups is below 20 (the minimum recommended
+for reliable cluster bootstrap; Ukoumunne, Gulliford, Chinn, Sterne, & Burney, 2003),
+cluster bootstrap falls back to i.i.d. resampling and emits a `RuntimeWarning`. SHAP
+significance calls may be anti-conservative under within-group correlation in this regime.
+The microdata deduplication step (averaging K-fold SHAP values down to N rows per
+observation) operates on the original cluster structure regardless of whether the
+i.i.d. fallback fired, because the K-replication structure of inference-mode data is
+independent of the bootstrap resampling method.
+
+In inference mode (all K folds use the full dataset), cluster bootstrap is not applied
+at the population level. Per-individual bootstrap-of-CV inference falls back to plain
+`KFold` inner splits regardless of the outer strategy, because bootstrap resampling
+breaks group structure.
 
 #### Permutation Test
 - Null distributions built by shuffling `y_true` while holding `y_pred` fixed (one-sided,
@@ -825,10 +859,12 @@ pipeline product produces for that individual (Breiman, 2001):
 - Inference individual: ensemble-mean SHAP and prediction averaged across all K original
   `model_fold_k.cbm` files. This matches `infer.py`'s existing ensemble-prediction logic.
 
-Fold assignments for training individuals are reconstructed deterministically at predict-time
-from the saved `config_resolved.yaml` (which contains `random_seed` and `cv_folds`) without
-persisting a new artifact, using the same `get_cv_splitter()` call that `predict.py` uses
-internally.
+Fold assignments for training individuals are loaded from `fold_assignments.json`, a JSON
+array of integer fold indices (one per training sample) persisted by `train.py` at the end of
+the outer CV loop. This artifact-based approach eliminates dependence on data identity, sklearn
+version determinism, and stratification replication that the prior splitter-reconstruction
+approach required. All downstream consumers (`predict.py`, `shap_utils.py`, `indiv_reports.py`)
+load from this artifact rather than re-instantiating a CV splitter.
 
 **CI aggregation (estimand-matched to the point estimate)**:
 - Training individual i: CI is computed from the subset of iterations where i is **not** in
