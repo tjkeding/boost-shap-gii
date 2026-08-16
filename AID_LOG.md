@@ -30,10 +30,10 @@ The boost-shap-gii pipeline is a general-purpose tool for gradient boosting with
 
 Development utilized **Claude Code** (Anthropic), employing two model tiers:
 
-| Model | Usage | Tasks |
-|-------|----------|-------|
-| Claude Opus 4 | Analytical and review | Critical review of statistical methods, brainstorming sessions, code quality audits, risk assessment, and architectural decisions |
-| Claude Sonnet 4 | Implementation | Code scaffolding under direction, test implementation support, documentation updates, and file management |
+| Model | Tasks |
+|-------|-------|
+| Claude Opus 4 | Critical review of statistical methods, brainstorming sessions, code quality audits, risk assessment, and architectural decisions |
+| Claude Sonnet 4 | Code scaffolding under direction, test implementation support, documentation updates, and file management |
 
 This dual-model approach ensured that analytical depth (Opus) was applied to decisions with statistical or methodological consequences, while implementation efficiency (Sonnet) was used for well-specified coding tasks under explicit human direction.
 
@@ -160,7 +160,7 @@ LLM tool use carries no claim to scientific credit under project policy. All alg
   - *Degenerate bootstrap CI fallback*: `compute_bootstrap_ci` returns `(base_score, NaN, NaN)` with a `RuntimeWarning` when `n_boot_effective = 0` (all bootstrap iterations dropped). Prior implementation returned `(base_score, base_score, base_score)`, which could be mistaken for a valid zero-width CI.
   - *Two-tier nominal unseen validation*: `_validate_nominal_unseen` added to `utils.py`. Tier 1 raises `ValueError` when > 50% of unique unseen values are absent from the nominal codebook (systematic naming mismatch). Tier 2 emits `UserWarning` when > 10% of observations encounter unseen levels (data quality issue).
 - New test file `tests/test_build_20260507.py` (30 tests across 8 classes) covering seven previously unexercised code paths from the remediation cycle.
-- Post-remediation test suite: 625 tests across 17 test files; 624 passing (1 skipped — conditional on optional `psutil` dependency), 0 failing.
+- Post-remediation test suite: 625 tests across 17 test files; 624 passing (1 skipped, psutil not yet declared as a hard dependency at this point), 0 failing.
 
 **LLM tools used:**
 
@@ -179,7 +179,7 @@ LLM tool use carries no claim to scientific credit under project policy. All alg
 **Test metrics:**
 
 - Pre-remediation: 461 tests across 16 test files (458 passing; 3 failing on missing `nanoparquet` R package, environment-only).
-- Post-remediation: 625 tests across 17 test files; 624 passing, 1 skipped (psutil conditional), 0 failing.
+- Post-remediation: 625 tests across 17 test files; 624 passing, 1 skipped (psutil not yet declared as a hard dependency at this point), 0 failing.
 
 **Audit trail references (.aid/reports/):**
 
@@ -325,7 +325,45 @@ LLM tool use carries no claim to scientific credit under project policy. All dec
 
 ---
 
+### Session 2026-08-16 -- psutil dependency fix and spline diagnostic verbosity
+
+**Session scope:**
+
+- A production pipeline run on an institutional HPC cluster revealed two issues: (1) `psutil`, required by the `indiv_reports.py` memory guard (introduced in v1.2.0), was never declared as a dependency in `pyproject.toml`, `environment.yaml`, or `check_env.py`, causing an `ImportError` at the individual reports stage; (2) the per-iteration spline degree downgrade warnings produced thousands of identical `[SHAP] Spline degree downgraded...` messages for low-cardinality features, obscuring earlier pipeline output.
+
+**Changes implemented:**
+
+- *psutil hard dependency*: `psutil` added to `pyproject.toml` dependencies, `environment.yaml` dependencies, and `check_env.py` `PYTHON_DEPS` list. The `boost-shap-gii check-env` preflight now validates psutil availability.
+- *Spline downgrade diagnostic*: the per-call print in `_get_adaptive_knots_and_degree` was removed. A new function `_diagnose_spline_downgrades` inspects each non-nominal feature's unique interior knot count in the full dataset and emits a single summary at the start of the SHAP pipeline, listing all features whose spline degree will be downgraded and noting that their interactions are also affected.
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for implementation planning support and documentation updates.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction and test implementation support.
+
+LLM tool use carries no claim to scientific credit under project policy. All scope decisions and remediation strategy were determined by the researcher.
+
+**Test metrics:**
+
+- Pre-design: 725/725 passing.
+- Post-design: 733/733 passing (+8 new tests covering `_diagnose_spline_downgrades`, psutil dependency pinning in `pyproject.toml`, `environment.yaml`, and `check_env.py`).
+
+**Audit trail references (.aid/reports/):**
+
+- Implementation plan: `boost-shap-gii_implement_plan_20260816_120000.md`
+- Implementation build: `boost-shap-gii_implement_build_20260816_121500.md`
+- Test report: `boost-shap-gii_test_20260816_124800.md`
+- Document report: `boost-shap-gii_document_20260816_130000.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Post-1.4.0 maintenance -- 2026-08-16
+
+Maintenance commit (no version bump). Adds `psutil` as a declared hard dependency (was used since v1.2.0 but never added to `pyproject.toml`, `environment.yaml`, or `check_env.py`). Replaces per-iteration spline degree downgrade warnings with a single upfront diagnostic block at the start of the SHAP pipeline.
+
+---
 
 ### Version 1.4.0 -- 2026-08-14 (CV strategy hardening and cluster bootstrap)
 

@@ -48,7 +48,7 @@
  <gates>
  <pii_screening status="pass">
  <scan_scope>README.md, INPUT_SPECIFICATION.md, AID_LOG.md, src/boost_shap_gii/*.py, src/boost_shap_gii/scripts/*.R/*.sh.aid/project_claude.md.aid/reports/*.md (52 files).</scan_scope>
- <patterns_scanned>absolute filesystem paths (/Users/, /Volumes/, /home/), email addresses, hostnames (.local.internal, milgram, farnam, grace.hpc), IPv4 addresses, UUIDs, conda/miniconda paths, sandbox-path leakage, usernames outside public GitHub URLs.</patterns_scanned>
+ <patterns_scanned>absolute filesystem paths (/Users/, /Volumes/, /home/), email addresses, hostnames (.local.internal, institutional HPC hostnames), IPv4 addresses, UUIDs, conda/miniconda paths, sandbox-path leakage, usernames outside public GitHub URLs.</patterns_scanned>
  <findings>None. Public GitHub URL (https://github.com/tjkeding/boost-shap-gii) is exempt per CONVENTIONS.md PII Screening Gate doctrine.</findings>
  </pii_screening>
  <llm_attribution status="pass">

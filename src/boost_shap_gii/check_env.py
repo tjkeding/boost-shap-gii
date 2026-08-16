@@ -7,7 +7,7 @@ import importlib
 
 PYTHON_DEPS = [
     "catboost", "optuna", "pyarrow", "sklearn", "scipy",
-    "pandas", "yaml", "joblib", "statsmodels"
+    "pandas", "yaml", "joblib", "statsmodels", "psutil"
 ]
 
 R_DEPS = [

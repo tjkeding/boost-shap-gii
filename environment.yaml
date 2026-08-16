@@ -24,6 +24,7 @@ dependencies:
   - statsmodels
   - joblib
   - pyarrow
+  - psutil
   - pip
   - pip:
     - catboost

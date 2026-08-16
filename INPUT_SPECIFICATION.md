@@ -258,6 +258,8 @@ See Section 10 for the full per-individual CI algorithm, output schema, and inte
 | `degree` | int | `3` | Polynomial degree (3 = cubic). Downgraded automatically when too few knots. |
 | `discrete_threshold` | int | `15` | Features with ≤ this many unique values per resample are treated as discrete (group means instead of spline). |
 
+**Spline downgrade diagnostic**: At the start of the SHAP pipeline (before any fold processing), the code inspects each non-nominal feature's unique interior knot count in the full dataset and emits a single summary listing all features whose spline degree will be downgraded from `degree` to 1. Features with fewer than 4 unique interior knots (values strictly between min and max, after percentile-based knot generation and deduplication) trigger this downgrade. Interactions involving these features are also affected. The downgrade is expected for low-cardinality ordinal or continuous features and does not affect correctness; the diagnostic replaces the per-iteration warnings from prior versions.
+
 #### `aggregate_shap`
 
 Top-level config block (sibling of `shap`, not nested under it). Defines user-specified feature

@@ -163,6 +163,33 @@ def _get_effect_stratum(effect_name: str, effect_type: str, feature_types: Dict[
 # 2. V-Component Logic (Unified Signal Variance)
 # -----------------------------------------------------------------------------
 
+def _diagnose_spline_downgrades(X: pd.DataFrame, feature_types: Dict[str, str], spline_cfg: Dict[str, int]) -> None:
+    n_knots = spline_cfg["n_knots"]
+    degree = spline_cfg["degree"]
+    if degree <= 1:
+        return
+    downgraded = []
+    for name in X.columns:
+        if feature_types.get(name, "continuous") == "nominal":
+            continue
+        if name.startswith("shadow_"):
+            continue
+        vals = X[name].values
+        quantiles = np.linspace(0, 100, n_knots + 2)[1:-1]
+        knots = np.percentile(vals, quantiles)
+        knots = np.unique(knots)
+        knots = knots[(knots > np.min(vals)) & (knots < np.max(vals))]
+        if len(knots) < 4:
+            downgraded.append((name, len(knots)))
+    if not downgraded:
+        return
+    print(f"[SHAP] Spline degree will be downgraded from {degree} to 1 for {len(downgraded)} feature(s):")
+    print(f"[SHAP]   (fewer than 4 unique interior knots in the full dataset)")
+    for name, nk in downgraded:
+        print(f"[SHAP]     {name} ({nk} interior knot(s))")
+    print(f"[SHAP]   Interactions involving these features will also use degree-1 splines.")
+    print(f"[SHAP]   This is expected for low-cardinality ordinal/continuous features and does not affect correctness.")
+
 def _get_adaptive_knots_and_degree(arr: np.ndarray, target_knots: int, target_degree: int) -> Tuple[np.ndarray, int]:
     """
     Generates knots using percentiles, prunes duplicates (zero-inflation),
@@ -176,9 +203,6 @@ def _get_adaptive_knots_and_degree(arr: np.ndarray, target_knots: int, target_de
     knots = knots[(knots > min_x) & (knots < max_x)]
 
     if len(knots) < 4:
-        if target_degree > 1:
-            print(f"[SHAP] Spline degree downgraded from {target_degree} to 1 "
-                  f"(only {len(knots)} unique interior knots)")
         return knots, 1  # Downgrade to Linear
 
     return knots, target_degree
@@ -1555,6 +1579,8 @@ def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
         shadow_f = f"shadow_{f}"
         if f in feature_types:
             all_feature_types[shadow_f] = feature_types[f]
+
+    _diagnose_spline_downgrades(X_aligned, all_feature_types, config["shap"]["splines"])
 
     # Determine slices to process
     if task == "multiclass_classification" and class_labels:

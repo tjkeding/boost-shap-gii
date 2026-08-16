@@ -22,6 +22,7 @@ dependencies = [
     "joblib",
     "pyarrow",
     "catboost",
+    "psutil",
     "optuna",
 ]
 

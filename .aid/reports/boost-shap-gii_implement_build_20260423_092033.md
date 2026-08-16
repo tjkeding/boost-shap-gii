@@ -22,7 +22,7 @@
  </change>
  <change id="V1" status="done" user_decision="n/a">
  <files_modified />
- <notes>Verification-only. Confirmed `pyproject.toml:17` declares `"pandas"` unpinned (no version floor, no ceiling). The unpinned dependency permits pandas 3.0+, which is the Milgram HPC runtime. patches are therefore required in any release consistent with this pyproject.toml, and are now applied. No file modification made for V1.</notes>
+ <notes>Verification-only. Confirmed `pyproject.toml:17` declares `"pandas"` unpinned (no version floor, no ceiling). The unpinned dependency permits pandas 3.0+, which is the institutional HPC cluster runtime. patches are therefore required in any release consistent with this pyproject.toml, and are now applied. No file modification made for V1.</notes>
  </change>
  </changes_applied>
  <summary>
@@ -31,5 +31,5 @@
  <skipped>0</skipped>
  <blocked>0</blocked>
  </summary>
- <next_steps>Recommended: run /test to design and execute regression tests that exercise CategoricalDtype columns with NaN at each of the three pipeline entry points (train, predict, infer). The test suite must (a) construct a `pd.Series` with `CategoricalDtype` whose categories exclude "__NA__" and contain NaN, (b) apply the patched encoding path, and (c) assert no TypeError, result dtype is CategoricalDtype, "__NA__" is present in the resulting category index, and NaN positions correctly map to "__NA__". After /test passes, proceed to /publish to commit and push to origin/main so the Milgram HPC environment can pick up the fix via pip reinstall from GitHub.</next_steps>
+ <next_steps>Recommended: run /test to design and execute regression tests that exercise CategoricalDtype columns with NaN at each of the three pipeline entry points (train, predict, infer). The test suite must (a) construct a `pd.Series` with `CategoricalDtype` whose categories exclude "__NA__" and contain NaN, (b) apply the patched encoding path, and (c) assert no TypeError, result dtype is CategoricalDtype, "__NA__" is present in the resulting category index, and NaN positions correctly map to "__NA__". After /test passes, proceed to /publish to commit and push to origin/main so the institutional HPC cluster environment can pick up the fix via pip reinstall from GitHub.</next_steps>
 </implement_report>

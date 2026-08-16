@@ -1,7 +1,7 @@
 <brainstorm_report>
  <meta project="boost-shap-gii" mode="brainstorm" timestamp="2026-04-23T12:35:47Z" />
  <context_files>
- <file path="src/boost_shap_gii/train.py" relevance="Contains the failing line at main nominal-encoding loop; locally at line 595 (with uncommitted Session 6 diagnostic), at line 449 in committed HEAD ec4398b installed on Milgram HPC." />
+ <file path="src/boost_shap_gii/train.py" relevance="Contains the failing line at main nominal-encoding loop; locally at line 595 (with uncommitted Session 6 diagnostic), at line 449 in committed HEAD ec4398b installed on the institutional HPC cluster." />
  <file path="src/boost_shap_gii/predict.py" relevance="Contains the same fillna pattern at line 135; must be patched in lockstep or predict will fail on Categorical-dtype parquet after training succeeds." />
  <file path="src/boost_shap_gii/infer.py" relevance="Contains the same fillna pattern at line 154; same reasoning as predict." />
  <file path="memory/session_history.md" relevance="Session 5 (commit c1a6dd7) addressed a related-but-distinct pandas 3.0 Categorical issue in _to_numeric_matrix, not in main's nominal-encoding loop." />
