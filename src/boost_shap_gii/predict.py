@@ -28,6 +28,7 @@ from .utils import (
     compute_bootstrap_ci,
     compute_permutation_test,
     validate_indiv_reports_config,
+    load_transform_module,
 )
 
 from .shap_utils import run_shap_pipeline
@@ -246,6 +247,26 @@ def main():
 
     cat_features_indices = nom_feats
 
+    tx_config_path = os.path.join(run_dir, "transform_config.json")
+    transform_module = None
+    tx_info = None
+    shap_scale_factor = 1.0
+    if os.path.exists(tx_config_path):
+        with open(tx_config_path) as f:
+            tx_info = json.load(f)
+        if tx_info.get("active", False):
+            transform_module = load_transform_module(config)
+            required_cols = tx_info.get("required_cols", [])
+            if required_cols:
+                missing = [c for c in required_cols if c not in df_raw.columns]
+                if missing:
+                    raise ValueError(
+                        f"[predict] transformations.required_cols missing from "
+                        f"dataframe: {missing}"
+                    )
+            shap_scale_factor = tx_info.get("shap_scale_factor", 1.0)
+            print(f"[INFO] Transformations active (file: {tx_info['file']})")
+
     for fold_idx in range(n_folds):
         val_idx = np.where(fold_assignments == fold_idx)[0]
         model_path = os.path.join(run_dir, f"model_fold_{fold_idx}.cbm")
@@ -268,6 +289,17 @@ def main():
                 preds = model.predict_proba(pool_val)[:, 1]
 
         oof_preds[val_idx] = preds
+        if transform_module is not None:
+            outcome_col = outcome_cols[0] if len(outcome_cols) == 1 else outcome_cols
+            train_idx_k = np.where(fold_assignments != fold_idx)[0]
+            _, _, fold_meta = transform_module.input_transform(
+                df_raw, train_idx_k, val_idx, outcome_col, tx_info.get("params", {})
+            )
+            preds_bt = transform_module.output_transform(
+                np.asarray(preds, dtype=float), fold_meta, tx_info.get("params", {}),
+                df_raw=df_raw, row_indices=val_idx
+            )
+            oof_preds[val_idx] = preds_bt
         counts[val_idx] += 1
 
     if np.any(counts == 0):
@@ -281,7 +313,7 @@ def main():
 
     # 6b. Inverse-transform multi-regression predictions if scaler exists
     scaler_path = os.path.join(run_dir, "target_scaler.json")
-    if task == "multi_regression" and os.path.exists(scaler_path):
+    if task == "multi_regression" and os.path.exists(scaler_path) and transform_module is None:
         with open(scaler_path) as f:
             scaler_info = json.load(f)
         means = np.array(scaler_info["mean"])
@@ -459,6 +491,9 @@ def main():
     if cv_strategy == "group" and group_column is not None and group_column in df_raw.columns:
         shap_ctx["groups"] = df_raw[group_column].values
         shap_ctx["cv_strategy"] = cv_strategy
+
+    if shap_scale_factor != 1.0:
+        shap_ctx["shap_scale_factor"] = shap_scale_factor
 
     run_shap_pipeline(shap_ctx)
 

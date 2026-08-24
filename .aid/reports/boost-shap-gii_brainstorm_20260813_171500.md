@@ -1,7 +1,7 @@
 <brainstorm_report>
   <meta project="boost-shap-gii" mode="brainstorm" timestamp="2026-08-13T17:15:00Z" />
   <context_files>
-    <file path="boost_shap_gii_techspec_cv_strategy_inner_repeats.md" relevance="Source tech spec from CFTSI-behavioral brainstorm proposing cv_strategy and n_inner_repeats config options" />
+    <file path="boost_shap_gii_techspec_cv_strategy_inner_repeats.md" relevance="Source tech spec from an external applied analysis proposing cv_strategy and n_inner_repeats config options" />
     <file path="src/boost_shap_gii/utils.py" relevance="Contains get_cv_splitter() (L163-175), fill_config_defaults(), validation functions" />
     <file path="src/boost_shap_gii/train.py" relevance="Outer CV loop (L866-886), inner CV in Optuna (L525-564), shadow training" />
     <file path="src/boost_shap_gii/predict.py" relevance="Fold replication via get_cv_splitter (L237, L249)" />
@@ -38,7 +38,7 @@
           <description>Number of bins equals number of CV folds. _StratifiedRegressionKFold wrapper intercepts split() and bins y internally via stratify_labels_for_regression(). Callers pass original continuous y to split(); wrapper handles discretization.</description>
           <pros>Most granular stratification for the given fold count. Wrapper eliminates call-site binning errors. pd.qcut with pd.cut fallback handles tied values.</pros>
           <cons>With large K and small N, bins may be sparse (mitigated by duplicates='drop').</cons>
-          <statistical_considerations>K bins ensures each fold draws proportionally from each quantile slice of the target distribution, directly addressing the fold-composition variance that motivated this feature (CFTSI childchild: one fold with SD(y)=7.58 vs. overall 13.0). The pd.cut fallback produces equal-width bins when quantile boundaries coincide, which is less optimal for skewed distributions but still reduces extreme fold imbalance.</statistical_considerations>
+          <statistical_considerations>K bins ensures each fold draws proportionally from each quantile slice of the target distribution, directly addressing the fold-composition variance that motivated this feature (external applied analysis: one fold with SD(y)=7.58 vs. overall 13.0). The pd.cut fallback produces equal-width bins when quantile boundaries coincide, which is less optimal for skewed distributions but still reduces extreme fold imbalance.</statistical_considerations>
         </approach>
         <approach id="A2" label="Fixed 4 bins (rsample convention, rejected)" feasibility="high" risk="low">
           <description>Always use 4 quartile bins regardless of fold count.</description>

@@ -31,6 +31,7 @@ from .utils import (
     compute_permutation_test,
     _load_sig_GII_from_shap_stats,
     validate_indiv_reports_config,
+    load_transform_module,
 )
 
 from .shap_utils import run_shap_pipeline
@@ -262,6 +263,31 @@ def main():
         with open(scaler_path) as f:
             _scaler_info = json.load(f)
 
+    tx_config_path = os.path.join(train_dir, "transform_config.json")
+    transform_module = None
+    tx_info = None
+    shap_scale_factor = 1.0
+    if os.path.exists(tx_config_path):
+        with open(tx_config_path) as f:
+            tx_info = json.load(f)
+        if tx_info.get("active", False):
+            transform_module = load_transform_module(config)
+            required_cols = tx_info.get("required_cols", [])
+            if required_cols:
+                missing = [c for c in required_cols if c not in df_raw.columns]
+                if missing:
+                    raise ValueError(
+                        f"[infer] transformations.required_cols missing from "
+                        f"dataframe: {missing}"
+                    )
+            shap_scale_factor = tx_info.get("shap_scale_factor", 1.0)
+            print(f"[INFO] Transformations active (file: {tx_info['file']})")
+
+    if transform_module is not None:
+        fold_meta_path = os.path.join(train_dir, "fold_transform_metadata.json")
+        with open(fold_meta_path) as f:
+            _fold_transform_meta = json.load(f)
+
     for k, model_path in enumerate(model_files):
         if is_regression(task):
             model = CatBoostRegressor()
@@ -275,13 +301,19 @@ def main():
             else:
                 preds = model.predict_proba(pool_full)[:, 1]
 
+        if transform_module is not None:
+            preds = transform_module.output_transform(
+                np.asarray(preds, dtype=float), _fold_transform_meta[k], tx_info.get("params", {}),
+                df_raw=df_raw, row_indices=np.arange(len(df_raw))
+            )
+
         pred_accum += preds
 
         # --- Per-model performance metrics (if outcomes present) ---
         if has_outcomes and n_supervised > 0:
             fold_preds = preds
             # Inverse-transform multi-regression per-model predictions if scaler exists
-            if task == "multi_regression" and _scaler_info is not None:
+            if task == "multi_regression" and _scaler_info is not None and transform_module is None:
                 fold_preds = preds * np.array(_scaler_info["scale"]) + np.array(_scaler_info["mean"])
 
             if task == "multi_regression":
@@ -325,7 +357,7 @@ def main():
     ensemble_preds = pred_accum / n_models
 
     # Inverse-transform multi-regression predictions if scaler exists
-    if task == "multi_regression" and _scaler_info is not None:
+    if task == "multi_regression" and _scaler_info is not None and transform_module is None:
         means = np.array(_scaler_info["mean"])
         scales = np.array(_scaler_info["scale"])
         ensemble_preds = ensemble_preds * scales + means
@@ -526,6 +558,9 @@ def main():
         "target_labels": target_labels,
         "inference_mode": True,
     }
+
+    if shap_scale_factor != 1.0:
+        shap_ctx["shap_scale_factor"] = shap_scale_factor
 
     if config["shap"].get("compute_global_on_inference", False):
         run_shap_pipeline(shap_ctx)

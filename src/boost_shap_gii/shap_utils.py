@@ -601,7 +601,7 @@ def _aggregate_effects(
             X_stacked[group_name] = np.nan
         col_idx = X_stacked.columns.get_loc(group_name)
         group_total_col_idx[group_name] = col_idx
-        feature_types[group_name] = "continuous"
+        feature_types[group_name] = "aggregate"
 
     # Helper: sum a list of columns from a dataframe, skipping missing ones
     def _sum_cols(df: pd.DataFrame, cols: List[str]) -> Optional[pd.Series]:
@@ -981,7 +981,9 @@ def _run_bootstrap_pipeline(
     X_raw_metadata: pd.DataFrame,
     ids: pd.Series,
     cluster_ids: Optional[np.ndarray] = None,
-    X_display: Optional[pd.DataFrame] = None
+    X_display: Optional[pd.DataFrame] = None,
+    shap_scale_factor: float = 1.0,
+    inference_mode: bool = False,
 ) -> pd.DataFrame:
 
     # Prep Matrices — single numeric conversion for both real and shadow
@@ -989,6 +991,13 @@ def _run_bootstrap_pipeline(
     X_vals = _to_numeric_matrix(X_full)
 
     SHAP_vals_shadow = df_shap_shadow.values if not df_shap_shadow.empty else None
+
+    if shap_scale_factor != 1.0:
+        SHAP_vals = SHAP_vals * shap_scale_factor
+        if SHAP_vals_shadow is not None:
+            SHAP_vals_shadow = SHAP_vals_shadow * shap_scale_factor
+        print(f"[SHAP] Scaled SHAP values by alpha={shap_scale_factor:.6f} "
+              f"(back_transform_shap=true)")
 
     # For microdata: extract real-feature columns from X_full
     real_feature_names = [n for n in feature_names if not n.startswith("shadow_")]
@@ -1154,6 +1163,11 @@ def _run_bootstrap_pipeline(
             n_real_in = sum(1 for s in real_strata if s == stratum)
             n_shadow_in = sum(1 for s in shadow_strata if s == stratum)
             print(f"[SHAP]   Stratum '{stratum}': {n_real_in} real, {n_shadow_in} shadow")
+            if n_shadow_in > 0 and n_shadow_in < 3:
+                print(f"[SHAP]   WARNING: Stratum '{stratum}' has only {n_shadow_in} shadow "
+                      f"effect(s). Statistical power for significance detection is limited "
+                      f"(null exceedance rate = 1/{n_shadow_in + 1} = "
+                      f"{1/(n_shadow_in + 1):.0%}).")
 
         # Assign per-stratum max noise to each real effect
         for e in range(n_features):
@@ -1317,10 +1331,15 @@ def _run_bootstrap_pipeline(
                                  os.path.join(out_dir, "bootstrap_distributions_GII.parquet"))
 
     # 6. Save Microdata (Real)
-    # When cluster_ids is present (inference mode), microdata should show one row
-    # per observation (averaged across K folds), not K duplicates.
+    # In inference mode, df_shap holds K duplicate rows per observation (one per
+    # fold model); collapse to one row per observation via original_cluster_ids
+    # before saving. This must NOT fire in predict mode: when cv_strategy="group",
+    # cluster_ids also carries group labels for bootstrap resampling above, but
+    # predict-mode df_shap already has exactly one row per observation (OOF), so
+    # collapsing by cluster_ids there would incorrectly average distinct
+    # observations. inference_mode is the sole, explicit disambiguator.
     print(f"[SHAP] Saving Microdata Parquets (Top {output_micro_n} extra)...")
-    if original_cluster_ids is not None:
+    if original_cluster_ids is not None and inference_mode:
         df_shap_micro = df_shap.copy()
         df_shap_micro.index = original_cluster_ids
         df_shap_micro = df_shap_micro.groupby(level=0).mean()
@@ -1377,6 +1396,7 @@ def _run_shap_for_slice(
     X_raw = ctx.get("X_raw", None)
     ids = ctx.get("ids", None)
     n_jobs = config["execution"]["n_jobs"]
+    shap_scale_factor = ctx.get("shap_scale_factor", 1.0)
 
     label_str = f" [slice={slice_label}]" if slice_label else ""
     mode_str = "Inference" if inference_mode else "OOF"
@@ -1504,7 +1524,9 @@ def _run_shap_for_slice(
         nan_mask,
         X_raw, ids,
         cluster_ids=cluster_ids,
-        X_display=chunks_X[0] if inference_mode else None
+        X_display=chunks_X[0] if inference_mode else None,
+        shap_scale_factor=shap_scale_factor,
+        inference_mode=inference_mode,
     )
 
 

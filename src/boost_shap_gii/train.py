@@ -36,6 +36,8 @@ from .utils import (
     get_scoring_function,
     fill_config_defaults,
     validate_cv_config,
+    load_transform_module,
+    validate_transform_config,
 )
 
 # Suppress noisy warnings
@@ -763,6 +765,102 @@ def main():
         else:
             _diagnose_outcome_distribution(y, outcome_cols[0])
 
+    # Load and validate transformations module (Site 2)
+    transform_module = load_transform_module(config)
+    if transform_module is not None:
+        tx_cfg = config["transformations"]
+        validate_transform_config(tx_cfg.get("required_cols", []), df_raw, "train")
+        print(f"[INFO] Transformations module loaded: {tx_cfg['file']}")
+
+    # Upfront smoke test (Site 3)
+    if transform_module is not None:
+        seed = config["execution"]["random_seed"]
+        n_smoke = min(20, len(df_raw))
+        rng = np.random.RandomState(seed)
+        smoke_idx = rng.choice(len(df_raw), size=n_smoke, replace=False)
+        smoke_train = smoke_idx[:n_smoke // 2]
+        smoke_val = smoke_idx[n_smoke // 2:]
+        tx_params = tx_cfg.get("params", {})
+        outcome_col = outcome_cols[0] if len(outcome_cols) == 1 else outcome_cols
+
+        try:
+            y_sm_train, y_sm_val, sm_meta = transform_module.input_transform(
+                df_raw, smoke_train, smoke_val, outcome_col, tx_params
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Smoke test: input_transform failed on {n_smoke}-row subset: {e}"
+            ) from e
+
+        if len(y_sm_train) != len(smoke_train):
+            raise ValueError(
+                f"Smoke test: input_transform returned y_train with length "
+                f"{len(y_sm_train)}, expected {len(smoke_train)}"
+            )
+        if len(y_sm_val) != len(smoke_val):
+            raise ValueError(
+                f"Smoke test: input_transform returned y_val with length "
+                f"{len(y_sm_val)}, expected {len(smoke_val)}"
+            )
+
+        y_sm_all = np.concatenate([np.asarray(y_sm_train), np.asarray(y_sm_val)])
+        if not np.all(np.isfinite(y_sm_all)):
+            n_nonfinite = int(np.sum(~np.isfinite(y_sm_all)))
+            raise ValueError(
+                f"Smoke test: input_transform produced {n_nonfinite} non-finite "
+                f"value(s) (NaN or Inf)"
+            )
+
+        try:
+            json.dumps(sm_meta)
+        except (TypeError, ValueError) as e:
+            raise TypeError(
+                f"Smoke test: input_transform metadata is not JSON-serializable: {e}"
+            ) from e
+
+        try:
+            y_sm_rt = transform_module.output_transform(
+                np.asarray(y_sm_val, dtype=float), sm_meta, tx_params,
+                df_raw=df_raw, row_indices=smoke_val
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Smoke test: output_transform failed: {e}"
+            ) from e
+        if len(y_sm_rt) != len(smoke_val):
+            raise ValueError(
+                f"Smoke test: output_transform returned length {len(y_sm_rt)}, "
+                f"expected {len(smoke_val)}"
+            )
+
+        n_probe = len(smoke_val)
+        p1 = np.zeros(n_probe)
+        p2 = np.ones(n_probe)
+        p3 = np.full(n_probe, 2.0)
+        o1 = np.asarray(transform_module.output_transform(
+            p1, sm_meta, tx_params, df_raw=df_raw, row_indices=smoke_val
+        ), dtype=float)
+        o2 = np.asarray(transform_module.output_transform(
+            p2, sm_meta, tx_params, df_raw=df_raw, row_indices=smoke_val
+        ), dtype=float)
+        o3 = np.asarray(transform_module.output_transform(
+            p3, sm_meta, tx_params, df_raw=df_raw, row_indices=smoke_val
+        ), dtype=float)
+
+        expected_o3 = 2.0 * o2 - o1
+        atol = 1e-6 * (np.abs(o2 - o1).max() + 1e-10)
+        is_affine = np.allclose(o3, expected_o3, atol=atol, rtol=1e-6)
+
+        if tx_cfg.get("back_transform_shap", False) and not is_affine:
+            raise ValueError(
+                "back_transform_shap=true but the output_transform is not affine. "
+                "SHAP back-transformation requires output_transform(x) = alpha * x + beta "
+                "for a constant alpha. Non-affine transforms break SHAP additivity."
+            )
+
+        print(f"[INFO] Smoke test passed ({n_smoke} rows). "
+              f"Transform is {'affine' if is_affine else 'non-affine'}.")
+
     # A. Force Nominal to String -> Category.
     # NaN is filled with the literal string "__NA__" before encoding. CatBoost treats
     # "__NA__" as a valid category level, allowing the model to learn whether missingness
@@ -843,7 +941,7 @@ def main():
 
     # Auto-scale multi-regression targets to common scale
     target_scaler = None
-    if task == "multi_regression":
+    if task == "multi_regression" and transform_module is None:
         from sklearn.preprocessing import StandardScaler
         target_scaler = StandardScaler()
         y_values = target_scaler.fit_transform(y.values)
@@ -925,6 +1023,7 @@ def main():
 
     fold_metrics = []
     fold_assignments = np.full(len(X), -1, dtype=int)
+    all_fold_transform_meta = []
 
     print(f"[INFO] Starting {splitter.get_n_splits()}-Fold Nested CV...")
 
@@ -934,6 +1033,39 @@ def main():
         X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
         fold_assignments[val_idx] = fold_idx
         y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+        fold_meta = None
+        if transform_module is not None:
+            y_train, y_val, fold_meta = transform_module.input_transform(
+                df_raw, train_idx, val_idx, outcome_col, tx_cfg.get("params", {})
+            )
+            y_train = pd.Series(y_train, index=y.iloc[train_idx].index)
+            y_val = pd.Series(y_val, index=y.iloc[val_idx].index)
+            all_fold_transform_meta.append(fold_meta)
+
+        if transform_module is not None and fold_idx == 0:
+            if tx_cfg.get("back_transform_shap", False) and is_affine:
+                probe_0 = np.zeros(len(val_idx))
+                probe_1 = np.ones(len(val_idx))
+                ot_0 = np.asarray(transform_module.output_transform(
+                    probe_0, fold_meta, tx_cfg.get("params", {}),
+                    df_raw=df_raw, row_indices=val_idx
+                ), dtype=float)
+                ot_1 = np.asarray(transform_module.output_transform(
+                    probe_1, fold_meta, tx_cfg.get("params", {}),
+                    df_raw=df_raw, row_indices=val_idx
+                ), dtype=float)
+                alpha_vec = ot_1 - ot_0
+                if not np.allclose(alpha_vec, alpha_vec[0], rtol=1e-6):
+                    raise ValueError(
+                        "back_transform_shap=true but output_transform has "
+                        "non-constant slope across samples in fold 0. "
+                        "This indicates a sample-dependent scale factor."
+                    )
+                shap_scale_factor = float(alpha_vec[0])
+                print(f"[INFO] SHAP scale factor (alpha) = {shap_scale_factor:.6f}")
+            else:
+                shap_scale_factor = 1.0
 
         # --- PHASE 1: CLEAN TRAINING ---
         # A. Tune
@@ -1083,6 +1215,21 @@ def main():
     # 6. Finalize
     print("\n[INFO] CV Complete. Saving Global Artifacts...")
     save_json_atomic(fold_assignments.tolist(), os.path.join(run_dir, "fold_assignments.json"))
+
+    if transform_module is not None:
+        tx_artifact = {
+            "active": True,
+            "file": tx_cfg["file"],
+            "params": tx_cfg.get("params", {}),
+            "required_cols": tx_cfg.get("required_cols", []),
+            "is_affine": is_affine,
+            "back_transform_shap": tx_cfg.get("back_transform_shap", False),
+            "shap_scale_factor": shap_scale_factor,
+        }
+        save_json_atomic(tx_artifact, os.path.join(run_dir, "transform_config.json"))
+        print(f"[INFO] Saved transform_config.json")
+        save_json_atomic(all_fold_transform_meta, os.path.join(run_dir, "fold_transform_metadata.json"))
+        print(f"[INFO] Saved fold_transform_metadata.json ({len(all_fold_transform_meta)} folds)")
 
     # We include ID if available in raw, else just index
     id_col = "id" if "id" in df_raw.columns else "index"

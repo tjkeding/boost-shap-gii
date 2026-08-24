@@ -357,7 +357,59 @@ LLM tool use carries no claim to scientific credit under project policy. All sco
 
 ---
 
+### Session 2026-08-24 -- Fold transform metadata artifact and microdata groupby fix
+
+**Date:** 2026-08-24
+
+**Session scope:**
+
+- Two implementation cycles addressing architectural and correctness issues:
+  - *Fold transform metadata artifact*: `train.py` now persists `fold_transform_metadata.json` (a length-K array of per-fold transform metadata objects returned by `input_transform`). `infer.py` loads this artifact instead of re-reading the training data file and re-calling `input_transform`. This decouples `infer.py` from the training data file: inference now depends only on persisted model artifacts, the transform config, and the inference-time dataset.
+  - *Microdata groupby fix*: `_run_bootstrap_pipeline` in `shap_utils.py` now takes an explicit `inference_mode` parameter. The K-fold SHAP deduplication step (groupby collapse of K replicate rows to N observation rows) is gated on `inference_mode=True`. Previously, the collapse was triggered whenever `cluster_ids` was non-None, which conflated two distinct semantics: infer-mode K-duplicate collapse and predict-mode group-CV cluster bootstrap resampling. When `cv_strategy="group"` was active in predict mode, the groupby inappropriately averaged distinct within-cluster observations, producing a length mismatch at the microdata-saving step. The explicit flag resolves this by restricting the collapse to its intended context (inference mode only).
+- End-to-end dry-run coverage expansion: five new test files (41 tests) exercising binary classification, multiclass classification, multi-regression, the no-transform + group-CV path, and actual `plot.R` subprocess execution for the first time. These tests are excluded from the GitHub repository by `.gitignore`, consistent with existing project policy.
+- Documentation updates: `INPUT_SPECIFICATION.md` updated with `fold_transform_metadata.json` artifact documentation, infer.py architectural note, and corrected microdata deduplication description. `AID_LOG.md` updated (this entry).
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for implementation planning support, test design analysis, documentation coordination.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction, test execution support.
+- Claude Sonnet 5 (Anthropic): used for test design, test execution support, and documentation edits under direction.
+
+LLM tool use carries no claim to scientific credit under project policy. All scope decisions, architectural design, and plan approvals were made by the researcher.
+
+**Key decisions (researcher-approved):**
+
+- *Fold transform metadata persistence*: the researcher approved persisting per-fold metadata from `input_transform` as `fold_transform_metadata.json`, eliminating `infer.py`'s dependency on the training data file. This strengthens `infer.py`'s architectural invariant that inference requires no access to training-time data.
+- *Explicit inference_mode flag*: the researcher approved disambiguating the microdata groupby collapse via an explicit `inference_mode` parameter rather than inferring collapse need from data shape. The explicit-flag approach prevents the silent-mislabeling risk that shape-based inference would carry for singleton-cluster edge cases.
+- *End-to-end dry-run scope*: the researcher directed that every task type, CV strategy variant, and the actual `plot.R` execution path be exercised before proceeding to documentation and publication.
+
+**Test metrics:**
+
+- Pre-session (v1.4.0 baseline + prior maintenance): 822 tests across 23 test files (822 passing, 0 failing).
+- Post-session: 863 tests across 28 test files (863 passing, 0 failing).
+
+**Audit trail references (.aid/reports/):**
+
+- Implementation plans: `boost-shap-gii_implement_plan_20260824_150000.md`, `boost-shap-gii_implement_plan_20260824_160000.md`
+- Implementation builds: `boost-shap-gii_implement_build_20260824_144205.md`, `boost-shap-gii_implement_build_20260824_160500.md`
+- Test reports: `boost-shap-gii_test_20260824_145731.md`, `boost-shap-gii_test_20260824_152923.md`, `boost-shap-gii_test_20260824_163600.md`
+- Document report: `boost-shap-gii_document_20260824_170000.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Version 1.5.0 -- 2026-08-24 (Outcome transformations and microdata fix)
+
+This release adds the outcome transformations API and fixes a correctness bug in predict-mode microdata saving.
+
+- **Outcome transformations API**: new `transformations` config block supports user-provided Python scripts with `input_transform` and `output_transform` functions. `train.py` applies `input_transform` per fold and runs a 20-row upfront smoke test (shape, finiteness, JSON serializability, round-trip, affinity). `predict.py` and `infer.py` apply `output_transform` per fold/model for back-transformation of predictions. Optional `back_transform_shap` key enables affine SHAP rescaling via the first-fold Jacobian (scale factor = alpha, the ratio of pre/post-transform outcome standard deviations).
+- **Fold transform metadata artifact**: `train.py` now persists `fold_transform_metadata.json` (a length-K array of per-fold metadata objects returned by `input_transform`). `infer.py` loads this artifact instead of re-reading the training data file and re-calling `input_transform`, eliminating the training-data dependency at inference time.
+- **Aggregate stratum type**: aggregate features are now assigned stratum type `"aggregate"` (previously `"continuous"`), ensuring the block-permutation shadow calibration (Au et al., 2022) correctly partitions strata.
+- **Microdata groupby fix**: `_run_bootstrap_pipeline` in `shap_utils.py` now takes an explicit `inference_mode` parameter. The K-fold SHAP deduplication step (groupby collapse of K replicate rows to N observation rows) is gated on `inference_mode=True` only. Previously, the collapse was triggered whenever `cluster_ids` was non-None, which conflated infer-mode K-duplicate collapse with predict-mode group-CV cluster bootstrap labels, producing a length mismatch crash when `cv_strategy="group"` was active.
+- **Documentation**: README.md updated with Outcome Transformations section. INPUT_SPECIFICATION.md updated with `fold_transform_metadata.json` artifact documentation and corrected microdata deduplication description.
+
+---
 
 ### Post-1.4.0 maintenance -- 2026-08-16
 

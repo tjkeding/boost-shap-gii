@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
 import warnings
@@ -445,6 +446,15 @@ def fill_config_defaults(
     _set(["modeling", "cv_strategy"], "uniform")
     _set(["modeling", "tuning", "n_inner_repeats"], 1)
 
+    # -- transformations --
+    if "transformations" in config:
+        tx = config["transformations"]
+        if "file" not in tx:
+            raise ValueError("transformations.file is required when the transformations block is present")
+        _set(["transformations", "params"], {})
+        _set(["transformations", "required_cols"], [])
+        _set(["transformations", "back_transform_shap"], False)
+
     # -- modeling.task_type (needed for loss/scoring inference) --
     if "task_type" not in config.get("modeling", {}):
         task = _infer_task_type(config)
@@ -504,6 +514,86 @@ def fill_config_defaults(
     validate_spline_config(config)
 
     return config, filled
+
+
+def load_transform_module(config: dict):
+    """Load a user-supplied transformation module from disk.
+
+    Returns None if no transformations block is present in config. Otherwise
+    resolves the file path, loads the module via importlib, and validates that
+    both ``input_transform`` and ``output_transform`` are callable attributes.
+
+    Parameters
+    ----------
+    config : dict
+        Pipeline configuration dict (post-defaults).
+
+    Returns
+    -------
+    module or None
+        Loaded module object, or None if transformations not configured.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the resolved file path does not exist.
+    AttributeError
+        If ``input_transform`` or ``output_transform`` is absent or not callable.
+    """
+    if "transformations" not in config:
+        return None
+
+    tx = config["transformations"]
+    raw_path = tx["file"]
+
+    if not os.path.isabs(raw_path):
+        base = config.get("data", {}).get("data_dir", os.getcwd())
+        resolved = os.path.join(base, raw_path)
+    else:
+        resolved = raw_path
+
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(
+            f"transformations.file not found: '{resolved}' "
+            f"(resolved from '{raw_path}')"
+        )
+
+    spec = importlib.util.spec_from_file_location("_boost_shap_gii_transforms", resolved)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    for attr in ("input_transform", "output_transform"):
+        obj = getattr(module, attr, None)
+        if obj is None or not callable(obj):
+            raise AttributeError(
+                f"transformations.file '{resolved}' must define a callable '{attr}'"
+            )
+
+    return module
+
+
+def validate_transform_config(required_cols: list, df, stage: str) -> None:
+    """Validate that all required transformation columns are present in the dataframe.
+
+    Parameters
+    ----------
+    required_cols : list
+        Column names declared in ``transformations.required_cols``.
+    df : pd.DataFrame
+        Dataframe to validate against.
+    stage : str
+        Pipeline stage label (e.g., 'train', 'predict') for error context.
+
+    Raises
+    ------
+    ValueError
+        If any required column is absent from ``df``.
+    """
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"[{stage}] transformations.required_cols missing from dataframe: {missing}"
+        )
 
 
 # =============================================================================

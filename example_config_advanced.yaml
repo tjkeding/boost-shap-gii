@@ -138,6 +138,12 @@ shap:
 #     - "subscale_B_item1"
 #     - "subscale_B_item2"
 
+# transformations:
+#   file: "path/to/transform_script.py"  # Required. Path to Python script.
+#   params: {}                            # Optional. Passed to transform functions.
+#   required_cols: []                     # Optional. Columns needed in df_raw for output_transform.
+#   back_transform_shap: false            # Optional. Scale SHAP to original units (requires affine transform).
+
 plot:
   outcome_max: 100.0             # Theoretical maximum of the outcome (scales GII plot magnitudes)
   negate_shap: false             # If true, sign-flip SHAP y-axis values on plots

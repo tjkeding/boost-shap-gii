@@ -215,4 +215,40 @@ Set `modeling.tuning.n_inner_repeats` (default `1`) to average inner CV scores a
 
 ---
 
+## Outcome Transformations
+
+The pipeline supports an optional, user-provided Python transform applied to the outcome before model training and reversed before evaluation. This is useful for outcomes that require a nonlinear reparameterization (e.g., a rate transform, a residualization against a baseline covariate) that the pipeline's own preprocessing does not cover.
+
+### Configuration
+
+Add a `transformations` block to the config (top-level, alongside `shap` and `plot`):
+
+```yaml
+transformations:
+  file: "path/to/my_transform.py"
+  params: {}
+  required_cols: []
+  back_transform_shap: false
+```
+
+The named script must define two functions:
+
+- `input_transform(df_raw, train_idx, val_idx, outcome_col, params) -> (y_train, y_val, metadata)`, called once per CV fold to produce the transformed training and validation targets. `metadata` is any JSON-serializable object needed later to reverse the transform.
+- `output_transform(predictions, metadata, params, *, df_raw=None, row_indices=None) -> predictions`, called to map predictions on the transformed scale back to the original outcome scale.
+
+Before training begins, the pipeline runs an automatic smoke test on a small subset of the data, checking execution, output shapes, finiteness, JSON-serializability of `metadata`, and the round-trip correctness of `output_transform`.
+
+### SHAP Back-Transformation
+
+When `back_transform_shap: true`, the pipeline additionally verifies that the transform is affine (via a linear-regression check during the smoke test) and, if so, rescales SHAP values by the transform's slope so that M, V, and GII are reported in original-outcome units. The pipeline halts with an error if `back_transform_shap: true` is requested for a transform found to be non-affine, since SHAP additivity does not survive a nonlinear back-transformation.
+
+### Interactions with Other Features
+
+- When a `transformations` block is active, `multi_regression`'s automatic outcome z-scoring is skipped; the transform takes full ownership of the outcome space.
+- `infer.py` applies `output_transform` using per-fold metadata persisted by `train.py` (`fold_transform_metadata.json`); it does not require access to the original training data file.
+
+See `INPUT_SPECIFICATION.md` for the full transform API contract, the smoke test specification, and the `transform_config.json` / `fold_transform_metadata.json` artifact schemas.
+
+---
+
 See `INPUT_SPECIFICATION.md` for exhaustive technical details, data schemas, and mathematical formulas.

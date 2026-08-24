@@ -150,6 +150,10 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
   for classification, mean for regression).
 - Soft voting assumes calibrated probability outputs from CatBoost. For the supported loss
   functions (Logloss, MultiClass, RMSE, MultiRMSE), this assumption holds.
+- When transformations are active, `infer.py` loads `fold_transform_metadata.json` (written
+  by `train.py`) to obtain the per-fold transform metadata needed by `output_transform`.
+  This eliminates any dependency on the training data file: `infer.py` consumes only the
+  persisted model artifacts, the transform config, and the inference-time dataset.
 - Population-level `run_shap_pipeline()` is now **conditional**: invoked only when
   `shap.compute_global_on_inference: true` in the config (default `false`). Users who
   require population-level GII on the inference dataset (e.g., as a distribution-shift
@@ -297,6 +301,51 @@ aggregate_shap:
 See Section 4 (SHAP Decomposition Details) for the full aggregation algorithm, shadow block-permutation
 strategy, and output effect naming conventions.
 
+#### `transformations`
+
+Top-level config block (sibling of `shap` and `aggregate_shap`). Defines an optional user-provided Python transform script for outcome-space transformations applied per CV fold. When absent, no transformation is applied and the pipeline proceeds with the raw outcome column.
+
+| Key | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `file` | str | Yes | — | Path to a Python transform script. Relative paths are resolved against `data.data_dir`. The script must define `input_transform` and `output_transform` functions. |
+| `params` | dict | No | `{}` | Arbitrary parameters passed verbatim to both `input_transform` and `output_transform`. |
+| `required_cols` | list[str] | No | `[]` | Column names from `df_raw` required by `output_transform`. Validated at train, predict, and infer time; raises `ValueError` if any listed column is absent. |
+| `back_transform_shap` | bool | No | `false` | When `true`, SHAP values are scaled by the affine transform's slope (`alpha`) to report in original-scale units. Requires `output_transform` to be affine; the pipeline halts with an error if this condition is not met. |
+
+**Transform function API contract**
+
+The transform script must define exactly two functions:
+
+`input_transform(df_raw, train_idx, val_idx, outcome_col, params) -> (y_train, y_val, metadata)` — called once per CV fold. `df_raw` is the full raw DataFrame; `train_idx` and `val_idx` are integer index arrays for the training and validation splits; `outcome_col` is the outcome column name; `params` is the dict from `transformations.params`. Returns `y_train` and `y_val` as 1-D arrays and `metadata` as any JSON-serializable object (persisted per fold). When transforms are active, the `multi_regression` StandardScaler is bypassed; transforms take full ownership of the outcome space.
+
+`output_transform(predictions, metadata, params, *, df_raw=None, row_indices=None) -> predictions` — called to back-transform predictions to the original outcome scale. Must accept `df_raw` and `row_indices` as keyword arguments even if unused. `predictions` is a 1-D array on the transformed scale; the return value is on the original scale.
+
+**Upfront smoke test**
+
+Before the fold loop begins, the pipeline runs a validation test on a 20-row deterministic subset of `df_raw`. The smoke test verifies: execution without exceptions, output shapes consistent with input, finiteness of `y_train` and `y_val`, JSON-serializability of `metadata`, the `output_transform` round-trip, and whether the transform is affine (assessed by fitting a linear regression on back-transformed vs. transformed predictions). If `back_transform_shap: true` and the transform is determined to be non-affine, the pipeline halts with an error before any fold processing begins.
+
+**`transform_config.json` inter-stage artifact**
+
+Written by `train.py` at the end of training; consumed by `predict.py` and `infer.py` to reproduce the transform configuration without re-reading the user config.
+
+| Field | Type | Description |
+|---|---|---|
+| `active` | bool | `true` when a `transformations` block is present and `file` resolves successfully. |
+| `file` | str | Absolute resolved path to the transform script. |
+| `params` | dict | The `transformations.params` dict (empty dict when omitted). |
+| `required_cols` | list | The `transformations.required_cols` list (empty list when omitted). |
+| `is_affine` | bool | `true` if the smoke test determined the transform to be affine. |
+| `back_transform_shap` | bool | Mirror of `transformations.back_transform_shap`. |
+| `shap_scale_factor` | float | The affine slope (`alpha`) used to rescale SHAP values when `back_transform_shap: true`; `1.0` when `back_transform_shap: false` or the transform is non-affine. |
+
+**`fold_transform_metadata.json` inter-stage artifact**
+
+Written by `train.py` alongside `transform_config.json` when transformations are active; consumed by `infer.py` to apply `output_transform` without re-reading or re-processing the training data. The file is a JSON array of length K (one entry per CV fold), where each element is the `metadata` object returned by `input_transform` for that fold. The metadata content is opaque to the pipeline (any JSON-serializable object); it is passed through to `output_transform(predictions, metadata, params)` verbatim. This artifact decouples `infer.py` from the training data file: inference requires only the persisted model files, `transform_config.json`, `fold_transform_metadata.json`, and the new inference-time dataset.
+
+| Field | Type | Description |
+|---|---|---|
+| (root) | list[Any] | Length-K array; `fold_transform_metadata[k]` is the metadata returned by `input_transform` for fold k. Content is user-defined (any JSON-serializable value). |
+
 #### `plot`
 
 All `plot.*` keys are consumed exclusively by the `plot` subcommand (`plot.R` via `boost-shap-gii plot`). They are not referenced by `train`, `predict`, or `infer`. All six keys below are required when the `plot` subcommand is invoked; missing keys cause a loud failure before any plot is generated.
@@ -392,6 +441,10 @@ ability to interpret M and V significance separately from GII significance.
   singleton_ordinal, singleton_nominal, interaction_continuous_continuous, etc.). Per-stratum
   maximum shadow GII is used as the noise threshold, preventing inflation from cross-type
   scale differences.
+- **Aggregate noise stratum**: Aggregate SHAP features defined via `aggregate_shap` are assigned
+  to a dedicated `singleton_aggregate` stratum, separate from the native singleton strata. With
+  `k` aggregate groups, the null exceedance rate is `1/(k+1)`. A warning is emitted when any
+  stratum contains fewer than 3 shadow features.
 
 #### Aggregate SHAP (Group-Level Decomposition)
 
@@ -494,10 +547,18 @@ as a list of arrays rather than a fixed 2-D ndarray.
 for reliable cluster bootstrap; Ukoumunne, Gulliford, Chinn, Sterne, & Burney, 2003),
 cluster bootstrap falls back to i.i.d. resampling and emits a `RuntimeWarning`. SHAP
 significance calls may be anti-conservative under within-group correlation in this regime.
-The microdata deduplication step (averaging K-fold SHAP values down to N rows per
-observation) operates on the original cluster structure regardless of whether the
-i.i.d. fallback fired, because the K-replication structure of inference-mode data is
-independent of the bootstrap resampling method.
+
+**Microdata deduplication**: the K-fold SHAP averaging step (grouping by observation ID to
+collapse K replicate SHAP rows to N rows) is gated on an explicit `inference_mode` flag
+within `_run_bootstrap_pipeline`. In inference mode (all K folds produce predictions for
+every observation), this collapse is necessary and operates on the original cluster
+structure regardless of whether the i.i.d. fallback fired. In OOF predict mode (each
+observation appears in exactly one fold's test set), no K-fold duplicates exist, so the
+collapse is skipped and per-observation microdata is emitted directly. This distinction
+prevents a length mismatch when `cv_strategy="group"` is active in predict mode: without
+the `inference_mode` gate, `cluster_ids` (set to group labels for bootstrap resampling)
+would trigger the groupby collapse inappropriately, averaging distinct within-cluster
+observations and producing fewer SHAP rows than the observation-id array expects.
 
 In inference mode (all K folds use the full dataset), cluster bootstrap is not applied
 at the population level. Per-individual bootstrap-of-CV inference falls back to plain
