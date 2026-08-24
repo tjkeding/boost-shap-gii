@@ -240,7 +240,7 @@ Before training begins, the pipeline runs an automatic smoke test on a small sub
 
 ### SHAP Back-Transformation
 
-When `back_transform_shap: true`, the pipeline additionally verifies that the transform is affine (via a linear-regression check during the smoke test) and, if so, rescales SHAP values by the transform's slope so that M, V, and GII are reported in original-outcome units. The pipeline halts with an error if `back_transform_shap: true` is requested for a transform found to be non-affine, since SHAP additivity does not survive a nonlinear back-transformation.
+When `back_transform_shap: true`, the pipeline additionally verifies that the transform is affine (via a linear-regression check during the smoke test) and, if so, rescales SHAP values by the transform's constant scale factor so that M, V, and GII are reported in original-outcome units. The pipeline halts with an error if `back_transform_shap: true` is requested for a transform found to be non-affine, since SHAP additivity does not survive a nonlinear back-transformation.
 
 ### Interactions with Other Features
 

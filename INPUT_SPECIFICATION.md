@@ -310,7 +310,7 @@ Top-level config block (sibling of `shap` and `aggregate_shap`). Defines an opti
 | `file` | str | Yes | — | Path to a Python transform script. Relative paths are resolved against `data.data_dir`. The script must define `input_transform` and `output_transform` functions. |
 | `params` | dict | No | `{}` | Arbitrary parameters passed verbatim to both `input_transform` and `output_transform`. |
 | `required_cols` | list[str] | No | `[]` | Column names from `df_raw` required by `output_transform`. Validated at train, predict, and infer time; raises `ValueError` if any listed column is absent. |
-| `back_transform_shap` | bool | No | `false` | When `true`, SHAP values are scaled by the affine transform's slope (`alpha`) to report in original-scale units. Requires `output_transform` to be affine; the pipeline halts with an error if this condition is not met. |
+| `back_transform_shap` | bool | No | `false` | When `true`, SHAP values are scaled by the affine transform's constant scale factor (`alpha`) to report in original-scale units. Requires `output_transform` to be affine; the pipeline halts with an error if this condition is not met. |
 
 **Transform function API contract**
 
@@ -336,7 +336,7 @@ Written by `train.py` at the end of training; consumed by `predict.py` and `infe
 | `required_cols` | list | The `transformations.required_cols` list (empty list when omitted). |
 | `is_affine` | bool | `true` if the smoke test determined the transform to be affine. |
 | `back_transform_shap` | bool | Mirror of `transformations.back_transform_shap`. |
-| `shap_scale_factor` | float | The affine slope (`alpha`) used to rescale SHAP values when `back_transform_shap: true`; `1.0` when `back_transform_shap: false` or the transform is non-affine. |
+| `shap_scale_factor` | float | The affine constant scale factor (`alpha`) used to rescale SHAP values when `back_transform_shap: true`; `1.0` when `back_transform_shap: false` or the transform is non-affine. |
 
 **`fold_transform_metadata.json` inter-stage artifact**
 
