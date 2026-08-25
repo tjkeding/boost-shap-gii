@@ -8,27 +8,25 @@ import json
 import os
 import glob
 import warnings
-from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 
 from .utils import (
-    _normalize_quotes,
     _label_nominal,
     _validate_nominal_unseen,
     _load_sig_GII_from_shap_stats,
     load_config,
-    save_json_atomic,
+    load_dataframe,
     detect_task,
-    is_classification,
     is_regression,
     get_scoring_function,
     compute_bootstrap_ci,
     compute_permutation_test,
     validate_indiv_reports_config,
     load_transform_module,
+    coerce_ordinal_column,
 )
 
 from .shap_utils import run_shap_pipeline
@@ -76,17 +74,7 @@ def main():
     # 3. Load Data
     data_path = config["paths"]["input_data"]
     print(f"[INFO] Loading data from {data_path}")
-    if data_path.endswith('.csv'):
-        try:
-            df_raw = pd.read_csv(data_path)
-        except (pd.errors.ParserError, ValueError, Exception):
-            print("[WARNING] Standard CSV parsing failed. Attempting auto-detection (sep=None, engine='python')...")
-            df_raw = pd.read_csv(data_path, sep=None, engine='python')
-    else:
-        df_raw = pd.read_parquet(data_path)
-
-    # Replace whitespace-only strings with NaN across entire dataframe
-    df_raw = df_raw.replace(r'^\s*$', pd.NA, regex=True)
+    df_raw = load_dataframe(data_path)
 
     # 4. Feature Selection & Type Enforcement
     print("[INFO] Enforcing types and features from training artifacts...")
@@ -112,6 +100,32 @@ def main():
     dropped = initial_len - len(df_raw)
     if dropped > 0:
         print(f"[INFO] Dropped {dropped} rows with missing outcome(s) (Mirroring train.py).")
+
+    _tx_config_path_early = os.path.join(run_dir, "transform_config.json")
+    if os.path.exists(_tx_config_path_early):
+        with open(_tx_config_path_early) as _f:
+            _tx_info_early = json.load(_f)
+        if _tx_info_early.get("active", False):
+            _tx_req = _tx_info_early.get("required_cols", [])
+            if _tx_req:
+                _tx_missing = [c for c in _tx_req if c not in df_raw.columns]
+                if _tx_missing:
+                    raise KeyError(
+                        f"[predict] transformations.required_cols references columns "
+                        f"not in dataset: {_tx_missing}"
+                    )
+                pre_tx_len = len(df_raw)
+                df_raw = df_raw.dropna(subset=_tx_req)
+                tx_dropped = pre_tx_len - len(df_raw)
+                if tx_dropped > 0:
+                    print(f"[INFO] Dropped {tx_dropped} rows with missing "
+                          f"transformations.required_cols value(s) "
+                          f"(Mirroring train.py)")
+                if len(df_raw) == 0:
+                    raise ValueError(
+                        "No data left after dropping rows with missing "
+                        "transformations.required_cols (Mirroring train.py)."
+                    )
 
     if len(outcome_cols) > 1:
         y = df_raw[outcome_cols].copy()
@@ -153,41 +167,8 @@ def main():
 
     # C. Cast Ordinals (Values -> Integer Codes using saved levels)
     for c in ord_feats:
-        levels = [_normalize_quotes(l) for l in feature_meta[c]['levels']]
-        df_raw[c] = df_raw[c].map(lambda v: _normalize_quotes(v) if isinstance(v, str) else v)
-
-        # Validate ordinal values against training levels (mirrors train.py)
-        unique_vals = df_raw[c].dropna().unique()
-        unknowns = [v for v in unique_vals if v not in levels]
-        if unknowns:
-            # Tier 1: unique-value fraction (hard error if >50% of distinct values are unknown)
-            unknown_frac = len(unknowns) / len(unique_vals)
-            if unknown_frac > 0.5:
-                raise ValueError(
-                    f"Feature '{c}': {unknown_frac:.0%} of unique values not in YAML levels "
-                    f"{levels}. Check for case mismatches or missing level definitions."
-                )
-            print(f"[WARNING] Feature '{c}': {len(unknowns)} unique value(s) not in YAML levels: {unknowns}")
-            # Tier 2: observation-level fraction (loud warning if >10% of observations are unknown)
-            obs_vals = df_raw[c].dropna()
-            n_unknown_obs = sum(v not in levels for v in obs_vals)
-            obs_frac = n_unknown_obs / len(obs_vals) if len(obs_vals) > 0 else 0.0
-            if obs_frac > 0.10:
-                print(
-                    f"[WARNING] Feature '{c}': {obs_frac:.1%} of non-missing observations "
-                    f"({n_unknown_obs}/{len(obs_vals)}) have values not in YAML levels. "
-                    f"This may indicate systematic data quality issues."
-                )
-
-        # Create categorical with exact training levels
-        cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
-        # Explicitly set out-of-category values to NaN before casting to avoid
-        # deprecated silent coercion (pandas 2.0+ FutureWarning)
-        _src = df_raw[c].where(df_raw[c].isin(levels) | df_raw[c].isna(), other=pd.NA)
-        # Convert to codes (0, 1, 2...). NaN becomes -1.
-        X[c] = _src.astype(cat_type).cat.codes.astype("Int64")
-        # Restore NaNs
-        X.loc[X[c] == -1, c] = pd.NA
+        levels = feature_meta[c]['levels']
+        X[c] = coerce_ordinal_column(df_raw[c], levels, c)
 
     # Reorder exactly as trained
     X = X[trained_features]
@@ -266,6 +247,9 @@ def main():
                     )
             shap_scale_factor = tx_info.get("shap_scale_factor", 1.0)
             print(f"[INFO] Transformations active (file: {tx_info['file']})")
+            ftm_path = os.path.join(run_dir, "fold_transform_metadata.json")
+            with open(ftm_path) as f:
+                _fold_transform_meta = json.load(f)
 
     for fold_idx in range(n_folds):
         val_idx = np.where(fold_assignments == fold_idx)[0]
@@ -290,13 +274,9 @@ def main():
 
         oof_preds[val_idx] = preds
         if transform_module is not None:
-            outcome_col = outcome_cols[0] if len(outcome_cols) == 1 else outcome_cols
-            train_idx_k = np.where(fold_assignments != fold_idx)[0]
-            _, _, fold_meta = transform_module.input_transform(
-                df_raw, train_idx_k, val_idx, outcome_col, tx_info.get("params", {})
-            )
             preds_bt = transform_module.output_transform(
-                np.asarray(preds, dtype=float), fold_meta, tx_info.get("params", {}),
+                np.asarray(preds, dtype=float), _fold_transform_meta[fold_idx],
+                tx_info.get("params", {}),
                 df_raw=df_raw, row_indices=val_idx
             )
             oof_preds[val_idx] = preds_bt
@@ -506,6 +486,10 @@ def main():
 
         n_jobs = config["execution"].get("n_jobs", 1)
 
+        cluster_ids_indiv = None
+        if cv_strategy == "group" and group_column is not None and group_column in df_raw.columns:
+            cluster_ids_indiv = df_raw[group_column].values
+
         # 1. Build cache at run_dir/bootstrap_refits/
         cache_summary = orchestrate_bootstrap_cache(
             run_dir=run_dir,
@@ -517,6 +501,7 @@ def main():
             config=config,
             n_jobs=n_jobs,
             random_seed=config["execution"]["random_seed"],
+            cluster_ids=cluster_ids_indiv,
         )
         print(
             f"[INFO] Bootstrap cache built: B={cache_summary['B']} iterations "
@@ -540,6 +525,7 @@ def main():
             mode="training",
             sig_GII_main=sig_GII_main,
             sig_GII_interaction=sig_GII_interaction,
+            cluster_ids=cluster_ids_indiv,
         )
         print(f"[INFO] Training indiv_reports/ emitted to {run_dir}.")
     else:

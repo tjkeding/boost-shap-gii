@@ -47,7 +47,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 
 3. **Implement (Plan + Build)** -- Implementation proceeded in two sub-phases: (a) a technical specification mapping each approved change to specific code modifications with risk assessment, and (b) execution of the specification. All plans required human approval before code generation began.
 
-4. **Test** -- Comprehensive test suite development (705 tests across 19 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
+4. **Test** -- Comprehensive test suite development (895 tests across 35 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
 
 5. **Clean** -- Code quality review for consistency, style, and maintainability.
 
@@ -56,7 +56,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 Key properties of this workflow:
 
 - All decisions required **explicit human approval** before implementation.
-- The pipeline was developed with a **test-first** approach; 705 tests validate statistical correctness, edge-case handling, and integration behavior.
+- The pipeline was developed with a **test-first** approach; 895 tests validate statistical correctness, edge-case handling, and integration behavior.
 - Every statistical and algorithmic choice was subjected to **formal critical review**, with findings documented and triaged individually.
 
 ## 5. Human Oversight
@@ -397,7 +397,65 @@ LLM tool use carries no claim to scientific credit under project policy. All sco
 
 ---
 
+### Session 2026-08-25 -- required_cols NaN handling, inference-mode cluster identity fix, and codebase cleanup
+
+**Date:** 2026-08-25
+
+**Session scope:**
+
+- **Cycle 1 (required_cols NaN handling)**: a production run on external data crashed because `validate_transform_config()` checks column existence but not per-row completeness, so `input_transform` received NaN in a `required_cols` covariate and its OLS fit failed. A brainstorm session validated a drop-and-proceed strategy for train.py/predict.py and a warn-and-produce-NaN strategy for infer.py (asymmetric by design: inference must return one prediction per input row). Implementation: train.py drops rows with NaN `required_cols` after the outcome-missing drop, with a post-drop assertion as a regression guard; predict.py mirrors the drop from the persisted `transform_config.json`; infer.py emits a warning and allows NaN-baseline rows to propagate to NaN back-transformed predictions. A first test pass surfaced a genuine product bug: infer.py's scoring mask excluded only missing outcomes, not non-finite back-transformed predictions, so sklearn scoring crashed whenever a required_cols-NaN row also had a ground-truth outcome. Fixed by adding finite-prediction intersection masks at all three infer.py scoring sites (per-model metrics, ensemble metrics, permutation test).
+- **Cycle 2 (critical review and inference-mode cluster identity fix)**: a full adversarial critical review of the transformations API, CV strategy, and SHAP aggregation feature interactions found the statistical foundations sound, with one major finding: per-individual SHAP CI bootstrap read cluster identity from an undocumented, never-populated config key instead of the pipeline's established `modeling.group_column` convention, making individual-level CIs anti-conservative under group CV (Cameron, Gelbach, & Miller, 2008) while population-level GII bootstrap correctly respected group structure. The first fix attempt did not functionally work: `orchestrate_bootstrap_cache`/`generate_indiv_reports` receive only the model's feature-only training matrix, from which `group_column` had already been stripped, so the corrected lookup evaluated as absent regardless of CV strategy. Test-design tracing caught this before it reached the test suite as a passing false-positive; the defect was routed as a P0 product bug with a test written to document the still-broken behavior. The real fix added explicit `cluster_ids` parameters to both functions: `orchestrate_bootstrap_cache` persists a new `cluster_ids.npy` artifact (mirroring the existing `y_train.npy` pattern) when training-mode resolution is active, and `generate_indiv_reports`' inference-mode branch loads this artifact rather than resolving cluster identity itself. This required a mid-build architectural correction: the original design had `infer.py` resolve `cluster_ids` from its own dataset, which was rejected because inference mode must never depend on the inference dataset's own columns for training-time cluster identity (its `group_column`, if present, may carry unrelated semantics) — inference is restricted to persisted artifacts by design. `infer.py`'s caller-side resolution was fully reverted; `predict.py` resolves `cluster_ids` from its own training-data `df_raw`, which is correct because `predict.py`'s `df_raw` is the training data. Two minor CR findings were also fixed: `predict.py` re-derived transform fold metadata by re-calling `input_transform` instead of loading the persisted `fold_transform_metadata.json` artifact (as `infer.py` already did correctly); `infer.py`'s permutation-test resolution lacked the minimum-1000 floor that `predict.py` already enforced.
+- **Cycle 3 (codebase cleanup)**: a full codebase review for dead code, redundancy, and reorganization opportunities produced 7 findings, all defensible and approved. Implementation: removed 14 verified-unused imports across 5 modules; wired two previously-unwired config validators (`validate_plot_config`, `validate_bootstrap_config`) into their intended call sites; replaced an inline model-loading block with the module's own existing helper function; extracted a shared `load_dataframe` function to `utils.py`, replacing three duplicated data-loading blocks in train.py/predict.py/infer.py; collapsed a pair of identical if/else branches; consolidated duplicated sentinel-handling logic across three dtype branches in the SHAP numeric-matrix conversion; extracted a shared `coerce_ordinal_column` function to `utils.py`, replacing three duplicated ~35-line ordinal validation-and-coercion blocks (a byproduct of the extraction eliminated an unnecessary in-place mutation of the raw input dataframe in predict.py/infer.py). All changes were behavior-preserving refactors; no config schema or CLI surface changes resulted.
+- **Documentation**: code comment consistency pass identified and consolidated four instances of duplicated or restated explanatory text (an energy-gate tolerance comment duplicated verbatim across two functions in `shap_utils.py`; a docstring in `train.py` repeating the same two literature citations three times; a function docstring in `indiv_reports.py` restating the module docstring's algorithm description almost verbatim; an inline comment in `utils.py` restating its enclosing docstring), each trimmed to a single concise statement without loss of substantive content. `AID_LOG.md` test counts corrected to reflect current totals; this session's entry added.
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for critical review, brainstorm sessions, implementation plan structuring, documentation coordination.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction, test execution support.
+- Claude Sonnet 5 (Anthropic): used for test design and execution, codebase cleanup review, implementation of the cleanup changes, documentation edits under direction.
+
+LLM tool use carries no claim to scientific credit under project policy. All scope decisions, architectural design (including the mid-build cluster-identity correction), and plan approvals were made by the researcher.
+
+**Key decisions (researcher-approved):**
+
+- *Asymmetric required_cols handling*: drop-and-proceed for train.py/predict.py (training must exclude incomplete rows), warn-and-produce-NaN for infer.py (inference must return one prediction per input row regardless of covariate completeness).
+- *Uniform finite-prediction scoring mask*: infer.py's three scoring sites now intersect the outcome-missingness mask with a finite-prediction mask, since baseline NaN propagation is per-row, not per-column.
+- *Cluster identity source of truth*: per-individual SHAP CI cluster identity must be sourced from `modeling.group_column`, matching the convention already used by population-level GII bootstrap.
+- *Inference-mode artifact-only invariant (reaffirmed)*: cluster/group identity for inference-mode individual reports must be sourced from a persisted training-time artifact (`cluster_ids.npy`), never from the inference dataset's own columns. This is a direct application of the pipeline's existing architectural constraint that inference mode operates exclusively from persisted artifacts.
+- *Codebase cleanup scope*: the researcher approved all 7 cleanup findings after independent re-verification confirmed no functional stubs or user-facing option loss among the proposed removals; one finding's cross-module scope was explicitly narrowed to an internal-consistency fix only, per researcher direction.
+
+**Test metrics:**
+
+- Pre-session (v1.5.0 baseline + prior maintenance): 863 tests across 28 test files (863 passing, 0 failing).
+- Post-cycle-1: 875 tests (875 passing, 0 failing).
+- Post-cycle-2: 895 tests (895 passing, 0 failing) — includes 2 obsolete-test re-expressions from the mid-build cluster-identity architectural correction.
+- Post-cycle-3 (cleanup): 895 tests (895 passing, 0 failing) — includes 3 obsolete-test re-expressions from the `coerce_ordinal_column` extraction (assertions strengthened to verify actual wiring rather than source-text substring presence).
+
+**Audit trail references (.aid/reports/):**
+
+- Implementation plans: `boost-shap-gii_implement_plan_20260824_230000.md`, `boost-shap-gii_implement_plan_20260825_000500.md`, `boost-shap-gii_implement_plan_20260825_021500.md`, `boost-shap-gii_implement_plan_20260825_082921.md`, `boost-shap-gii_implement_plan_20260825_132500.md`, `boost-shap-gii_implement_plan_20260825_140200.md`
+- Implementation builds: `boost-shap-gii_implement_build_20260825_001000.md`, `boost-shap-gii_implement_build_20260825_022500.md`, `boost-shap-gii_implement_build_20260825_083421.md`, `boost-shap-gii_implement_build_20260825_133000.md`, `boost-shap-gii_implement_build_20260825_141200.md`
+- Brainstorm: `boost-shap-gii_brainstorm_20260824_235500.md`
+- Critical review: `boost-shap-gii_cr_20260825_082540.md`
+- Clean review: `boost-shap-gii_clean_20260825_135559.md`
+- Test reports: `boost-shap-gii_test_20260825_001500.md`, `boost-shap-gii_test_20260825_074500.md`, `boost-shap-gii_test_20260825_085706.md`, `boost-shap-gii_test_20260825_133700.md`, `boost-shap-gii_test_20260825_142300.md`
+- Document report: `boost-shap-gii_document_20260825_143000.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Version 1.5.1 -- 2026-08-25 (required_cols NaN handling and codebase cleanup)
+
+Patch release fixing a P0 bug and consolidating internal code structure.
+
+- **required_cols NaN handling (P0 fix)**: `train.py` and `predict.py` now drop rows with NaN values in `transformations.required_cols` columns before invoking the transform module, preventing LAPACK SVD crashes on non-finite input. `infer.py` emits a diagnostic warning for NaN-baseline rows (no row drop, consistent with its "predict all samples" contract). A belt-and-suspenders assertion in `train.py` guards against future regressions.
+- **Shared utility extraction**: `coerce_ordinal_column()` (two-tier unknown-value validation) and `load_dataframe()` (CSV/Parquet dispatch) extracted to `utils.py`, replacing duplicated logic across `train.py`, `predict.py`, and `infer.py`.
+- **Import cleanup**: 14 unused imports removed across `train.py`, `predict.py`, and `infer.py`.
+- **Verboseness reduction**: Consolidated duplicated or restated explanatory comments in `shap_utils.py`, `train.py`, `indiv_reports.py`, and `utils.py`.
+- **Documentation**: AID_LOG.md test counts corrected (705 to 895); new session entry.
+
+---
 
 ### Version 1.5.0 -- 2026-08-24 (Outcome transformations and microdata fix)
 

@@ -25,9 +25,9 @@ import optuna
 from optuna.samplers import TPESampler
 
 from .utils import (
-    _normalize_quotes,
     _block_permute_shadow,
     load_config,
+    load_dataframe,
     save_json_atomic,
     detect_task,
     is_classification,
@@ -36,8 +36,10 @@ from .utils import (
     get_scoring_function,
     fill_config_defaults,
     validate_cv_config,
+    validate_bootstrap_config,
     load_transform_module,
     validate_transform_config,
+    coerce_ordinal_column,
 )
 
 # Suppress noisy warnings
@@ -209,19 +211,10 @@ def _diagnose_outcome_distribution(y_series: pd.Series, col_name: str) -> None:
     ``INPUT_SPECIFICATION.md``.
 
     Thresholds and their literature basis:
-    - Zero-inflation >= 15%  (Olsen & Schafer, 2001; Tooze et al., 2002)
-    - |Skewness| >= 2.0      (Kim, 2013)
-    - Excess kurtosis >= 5.0  (Kim, 2013, conservative from 7.0)
-
-    The |skewness| >= 2.0 threshold is anchored to Groeneveld & Meeden (1984)
-    moment-based skewness measures for assessing distributional non-normality.
-    The excess kurtosis >= 5.0 threshold derives from Joanes & Gill (1998)
-    sample-kurtosis bias-correction analysis, adjusted downward to a conservative
-    heuristic for tail-effect amplification under gradient boosting residual accumulation.
-
-    References:
-    - Groeneveld R.A., Meeden G. (1984) Measuring skewness and kurtosis. The Statistician 33: 391-399.
-    - Joanes D.N., Gill C.A. (1998) Comparing measures of sample skewness and kurtosis. The Statistician 47: 183-189.
+    - Zero-inflation >= 15%   (Olsen & Schafer, 2001; Tooze et al., 2002)
+    - |Skewness| >= 2.0       (Groeneveld & Meeden, 1984; Kim, 2013)
+    - Excess kurtosis >= 5.0  (Joanes & Gill, 1998, adjusted downward from 7.0 for
+      gradient-boosting tail sensitivity; Kim, 2013)
 
     The recommended Huber delta uses MAD-based scale estimation (Huber, 1981;
     Maronna et al., 2006). When MAD = 0 (common with >50% zero-inflation),
@@ -247,11 +240,7 @@ def _diagnose_outcome_distribution(y_series: pd.Series, col_name: str) -> None:
     skewness = float(sp_stats.skew(y_vals, bias=False))
     excess_kurt = float(sp_stats.kurtosis(y_vals, fisher=True, bias=False))
 
-    # ---- MAD-based Huber delta (always computed for inclusion in message) ----
-    # When >50% of observations share the median value (common with zero-inflation
-    # >50%), MAD collapses to 0. Fall back to IQR-based scale estimation:
-    #   sigma_hat = IQR / 1.3489, where 1.3489 = 2 * Phi^{-1}(3/4)
-    # is the IQR consistency factor at the normal (Maronna et al., 2006).
+    # Huber delta via MAD scale estimate; IQR/1.3489 fallback when MAD=0 (Maronna et al., 2006).
     mad = float(np.median(np.abs(y_vals - np.median(y_vals))))
     if mad > 0:
         scale_est = 1.4826 * mad
@@ -649,19 +638,7 @@ def main():
     # 2. Load Data
     data_path = config["paths"]["input_data"]
     print(f"[INFO] Loading data from {data_path}")
-
-    # Check extension
-    if data_path.endswith('.csv'):
-        try:
-            df_raw = pd.read_csv(data_path)
-        except (pd.errors.ParserError, ValueError, Exception):
-            print("[WARNING] Standard CSV parsing failed. Attempting auto-detection (sep=None, engine='python')...")
-            df_raw = pd.read_csv(data_path, sep=None, engine='python')
-    else:
-        df_raw = pd.read_parquet(data_path)
-
-    # Replace whitespace-only strings with NaN across entire dataframe
-    df_raw = df_raw.replace(r'^\s*$', pd.NA, regex=True)
+    df_raw = load_dataframe(data_path)
 
     outcome_cfg = config["modeling"]["outcome"]
     # multi_regression uses a list of outcome columns; all others use a single string
@@ -685,6 +662,26 @@ def main():
     if len(df_raw) == 0:
         raise ValueError("No data left after dropping rows with missing target.")
 
+    _tx_required_cols = config.get("transformations", {}).get("required_cols", [])
+    if _tx_required_cols:
+        _tx_missing_cols = [c for c in _tx_required_cols if c not in df_raw.columns]
+        if _tx_missing_cols:
+            raise KeyError(
+                f"transformations.required_cols references columns not in dataset: "
+                f"{_tx_missing_cols}"
+            )
+        pre_tx_len = len(df_raw)
+        df_raw = df_raw.dropna(subset=_tx_required_cols)
+        tx_dropped = pre_tx_len - len(df_raw)
+        if tx_dropped > 0:
+            print(f"[INFO] Dropped {tx_dropped} rows with missing "
+                  f"transformations.required_cols value(s)")
+        if len(df_raw) == 0:
+            raise ValueError(
+                "No data left after dropping rows with missing "
+                "transformations.required_cols."
+            )
+
     # 3. Feature Selection (THE NEW ENGINE)
     print("[INFO] Scanning and Selecting features based on YAML...")
     selector = FeatureSelector(config['features'])
@@ -704,6 +701,7 @@ def main():
     n_features = len(final_cols)
     config, filled_defaults = fill_config_defaults(config, n_rows, n_features)
     validate_cv_config(config, df=df_raw)
+    validate_bootstrap_config(config)
 
     if filled_defaults:
         print(f"[INFO] Auto-filled {len(filled_defaults)} config defaults:")
@@ -861,6 +859,16 @@ def main():
         print(f"[INFO] Smoke test passed ({n_smoke} rows). "
               f"Transform is {'affine' if is_affine else 'non-affine'}.")
 
+        _tx_req_cols = tx_cfg.get("required_cols", [])
+        for rc in _tx_req_cols:
+            _rc_nan = int(df_raw[rc].isna().sum())
+            if _rc_nan > 0:
+                raise ValueError(
+                    f"[INTERNAL] {_rc_nan} rows still have NaN in "
+                    f"transformations.required_cols column '{rc}' after "
+                    f"row-drop. This indicates a pipeline logic error."
+                )
+
     # A. Force Nominal to String -> Category.
     # NaN is filled with the literal string "__NA__" before encoding. CatBoost treats
     # "__NA__" as a valid category level, allowing the model to learn whether missingness
@@ -873,42 +881,9 @@ def main():
         X[c] = pd.to_numeric(X[c], errors='coerce').astype("float32")
 
     # C. Force Ordinal (Map levels to integers)
-    # This is critical so CatBoost treats them as numeric/ordinal, not string
     for c in ord_feats:
-        levels = [_normalize_quotes(l) for l in selector.feature_metadata[c]['levels']]
-        X[c] = X[c].map(lambda v: _normalize_quotes(v) if isinstance(v, str) else v)
-
-        # Verify all data values exist in levels
-        unique_vals = X[c].dropna().unique()
-        unknowns = [v for v in unique_vals if v not in levels]
-        if unknowns:
-            # Tier 1: unique-value fraction (hard error if >50% of distinct values are unknown)
-            unknown_frac = len(unknowns) / len(unique_vals)
-            if unknown_frac > 0.5:
-                raise ValueError(
-                    f"Feature '{c}': {unknown_frac:.0%} of unique values not in YAML levels "
-                    f"{levels}. Check for case mismatches or missing level definitions."
-                )
-            print(f"[WARNING] Feature '{c}': {len(unknowns)} unique value(s) not in YAML levels: {unknowns}")
-            # Tier 2: observation-level fraction (loud warning if >10% of observations are unknown)
-            obs_vals = X[c].dropna()
-            n_unknown_obs = sum(v not in levels for v in obs_vals)
-            obs_frac = n_unknown_obs / len(obs_vals) if len(obs_vals) > 0 else 0.0
-            if obs_frac > 0.10:
-                print(
-                    f"[WARNING] Feature '{c}': {obs_frac:.1%} of non-missing observations "
-                    f"({n_unknown_obs}/{len(obs_vals)}) have values not in YAML levels. "
-                    f"This may indicate systematic data quality issues."
-                )
-
-        # Create ordered categorical then code
-        cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
-        # Explicitly set out-of-category values to NaN before casting to avoid
-        # deprecated silent coercion (pandas 2.0+ FutureWarning)
-        _src = X[c].where(X[c].isin(levels) | X[c].isna(), other=pd.NA)
-        X[c] = _src.astype(cat_type).cat.codes.astype("Int64")
-        # Note: missing values become -1 in codes, we mask them back to NaN/Int64 NA
-        X.loc[X[c] == -1, c] = pd.NA
+        levels = selector.feature_metadata[c]['levels']
+        X[c] = coerce_ordinal_column(X[c], levels, c)
 
     # CatBoost expects Nominal columns to be listed in `cat_features`
     # It handles Float and Int automatically.

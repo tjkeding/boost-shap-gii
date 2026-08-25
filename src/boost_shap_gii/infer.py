@@ -13,18 +13,15 @@ from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
-import yaml
-
 from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 
 from .utils import (
-    _normalize_quotes,
     _label_nominal,
     _validate_nominal_unseen,
     load_config,
+    load_dataframe,
     save_json_atomic,
     detect_task,
-    is_classification,
     is_regression,
     get_scoring_function,
     compute_bootstrap_ci,
@@ -32,6 +29,7 @@ from .utils import (
     _load_sig_GII_from_shap_stats,
     validate_indiv_reports_config,
     load_transform_module,
+    coerce_ordinal_column,
 )
 
 from .shap_utils import run_shap_pipeline
@@ -94,17 +92,7 @@ def main():
     # 3. Load new data
     data_path = args.data
     print(f"[INFO] Loading inference data from {data_path}")
-    if data_path.endswith('.csv'):
-        try:
-            df_raw = pd.read_csv(data_path)
-        except (pd.errors.ParserError, ValueError, Exception):
-            print("[WARNING] Standard CSV parsing failed. Attempting auto-detection (sep=None, engine='python')...")
-            df_raw = pd.read_csv(data_path, sep=None, engine='python')
-    else:
-        df_raw = pd.read_parquet(data_path)
-
-    # Replace whitespace-only strings with NaN
-    df_raw = df_raw.replace(r'^\s*$', pd.NA, regex=True)
+    df_raw = load_dataframe(data_path)
     N = len(df_raw)
     print(f"[INFO] Loaded {N} rows from inference dataset.")
 
@@ -173,38 +161,8 @@ def main():
 
     # C. Cast Ordinals (Values -> Integer Codes using saved levels)
     for c in ord_feats:
-        levels = [_normalize_quotes(l) for l in feature_meta[c]['levels']]
-        df_raw[c] = df_raw[c].map(lambda v: _normalize_quotes(v) if isinstance(v, str) else v)
-
-        # Validate ordinal values against training levels (mirrors train.py)
-        unique_vals = df_raw[c].dropna().unique()
-        unknowns = [v for v in unique_vals if v not in levels]
-        if unknowns:
-            # Tier 1: unique-value fraction (hard error if >50% of distinct values are unknown)
-            unknown_frac = len(unknowns) / len(unique_vals)
-            if unknown_frac > 0.5:
-                raise ValueError(
-                    f"Feature '{c}': {unknown_frac:.0%} of unique values not in YAML levels "
-                    f"{levels}. Check for case mismatches or missing level definitions."
-                )
-            print(f"[WARNING] Feature '{c}': {len(unknowns)} unique value(s) not in YAML levels: {unknowns}")
-            # Tier 2: observation-level fraction (loud warning if >10% of observations are unknown)
-            obs_vals = df_raw[c].dropna()
-            n_unknown_obs = sum(v not in levels for v in obs_vals)
-            obs_frac = n_unknown_obs / len(obs_vals) if len(obs_vals) > 0 else 0.0
-            if obs_frac > 0.10:
-                print(
-                    f"[WARNING] Feature '{c}': {obs_frac:.1%} of non-missing observations "
-                    f"({n_unknown_obs}/{len(obs_vals)}) have values not in YAML levels. "
-                    f"This may indicate systematic data quality issues."
-                )
-
-        cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
-        # Explicitly set out-of-category values to NaN before casting to avoid
-        # deprecated silent coercion (pandas 2.0+ FutureWarning)
-        _src = df_raw[c].where(df_raw[c].isin(levels) | df_raw[c].isna(), other=pd.NA)
-        X[c] = _src.astype(cat_type).cat.codes.astype("Int64")
-        X.loc[X[c] == -1, c] = pd.NA
+        levels = feature_meta[c]['levels']
+        X[c] = coerce_ordinal_column(df_raw[c], levels, c)
 
     # Reorder exactly as trained
     X = X[trained_features]
@@ -288,6 +246,17 @@ def main():
         with open(fold_meta_path) as f:
             _fold_transform_meta = json.load(f)
 
+        _tx_req = tx_info.get("required_cols", [])
+        if _tx_req:
+            _nan_counts = {c: int(df_raw[c].isna().sum()) for c in _tx_req
+                           if c in df_raw.columns and df_raw[c].isna().any()}
+            if _nan_counts:
+                _total_nan = sum(_nan_counts.values())
+                print(f"[WARNING] {_total_nan} row(s) have NaN in "
+                      f"transformations.required_cols: {_nan_counts}. "
+                      f"Back-transformed predictions for these rows "
+                      f"will be NaN.")
+
     for k, model_path in enumerate(model_files):
         if is_regression(task):
             model = CatBoostRegressor()
@@ -316,19 +285,27 @@ def main():
             if task == "multi_regression" and _scaler_info is not None and transform_module is None:
                 fold_preds = preds * np.array(_scaler_info["scale"]) + np.array(_scaler_info["mean"])
 
+            if fold_preds.ndim > 1:
+                _pm_finite = np.all(np.isfinite(fold_preds), axis=1)
+            else:
+                _pm_finite = np.isfinite(fold_preds)
+            _pm_mask = supervised_mask & _pm_finite
+            if int(_pm_mask.sum()) == 0:
+                continue
+
             if task == "multi_regression":
-                y_true_sup = df_raw[outcome_cols].values[supervised_mask]
+                y_true_sup = df_raw[outcome_cols].values[_pm_mask]
                 for t_idx, col in enumerate(outcome_cols):
                     for m_name in ["neg_rmse", "neg_mae", "r2"]:
                         fn = get_scoring_function(m_name)
-                        raw = fn(y_true_sup[:, t_idx], fold_preds[supervised_mask][:, t_idx])
+                        raw = fn(y_true_sup[:, t_idx], fold_preds[_pm_mask][:, t_idx])
                         score = -raw if m_name.startswith("neg_") else raw
                         per_model_metrics_rows.append({
                             "fold": k, "metric": f"{m_name.replace('neg_', '').upper()}_{col}", "score": score
                         })
             elif task == "multiclass_classification":
-                y_true_sup = df_raw[outcome_cols[0]].values[supervised_mask]
-                preds_labels = np.argmax(fold_preds[supervised_mask], axis=1)
+                y_true_sup = df_raw[outcome_cols[0]].values[_pm_mask]
+                preds_labels = np.argmax(fold_preds[_pm_mask], axis=1)
                 for m_name in ["balanced_accuracy", "f1_weighted"]:
                     fn = get_scoring_function(m_name)
                     score = fn(y_true_sup, preds_labels)
@@ -336,8 +313,8 @@ def main():
                         "fold": k, "metric": m_name.upper(), "score": score
                     })
             else:
-                y_true_sup = df_raw[outcome_cols[0]].values[supervised_mask]
-                fold_sup = fold_preds[supervised_mask]
+                y_true_sup = df_raw[outcome_cols[0]].values[_pm_mask]
+                fold_sup = fold_preds[_pm_mask]
                 if task == "binary_classification":
                     metric_list = ["roc_auc", "accuracy"]
                 else:
@@ -364,8 +341,25 @@ def main():
         print("[INFO] Inverse-transformed predictions to original target scale")
 
     # 9. Performance metrics (only if supervised subset exists)
+    n_scorable = 0
+    _scorable_mask = supervised_mask
     if has_outcomes and n_supervised > 0:
-        print(f"\n--- Inference Performance (n={n_supervised}, 95% CI) ---")
+        if ensemble_preds.ndim > 1:
+            _ens_finite = np.all(np.isfinite(ensemble_preds), axis=1)
+        else:
+            _ens_finite = np.isfinite(ensemble_preds)
+        _scorable_mask = supervised_mask & _ens_finite
+        n_scorable = int(_scorable_mask.sum())
+        _n_excl = n_supervised - n_scorable
+        if _n_excl > 0:
+            print(f"[WARNING] {_n_excl} supervised row(s) excluded from "
+                  f"performance metrics due to non-finite predictions "
+                  f"(e.g. NaN from missing transformations.required_cols).")
+        if n_scorable == 0:
+            print("[WARNING] No rows with both ground-truth outcome and "
+                  "finite prediction. Performance metrics skipped.")
+    if has_outcomes and n_scorable > 0:
+        print(f"\n--- Inference Performance (n={n_scorable}, 95% CI) ---")
 
         # Select metrics based on task type
         if task in ("regression", "multi_regression"):
@@ -382,8 +376,8 @@ def main():
         # Extract supervised subset
         if task == "multi_regression":
             y_true_full = df_raw[outcome_cols].values
-            y_true = y_true_full[supervised_mask]
-            y_pred = ensemble_preds[supervised_mask]
+            y_true = y_true_full[_scorable_mask]
+            y_pred = ensemble_preds[_scorable_mask]
 
             for t_idx, col in enumerate(outcome_cols):
                 for m_name in metrics_to_calc:
@@ -401,8 +395,8 @@ def main():
                     results.append({"metric": disp_name, "score": score,
                                     "ci_low": low, "ci_high": high})
         elif task == "multiclass_classification":
-            y_true = df_raw[outcome_cols[0]].values[supervised_mask]
-            y_pred = ensemble_preds[supervised_mask]
+            y_true = df_raw[outcome_cols[0]].values[_scorable_mask]
+            y_pred = ensemble_preds[_scorable_mask]
             preds_labels = np.argmax(y_pred, axis=1)
 
             for m_name in metrics_to_calc:
@@ -416,8 +410,8 @@ def main():
                                 "ci_low": raw_low, "ci_high": raw_high})
         else:
             # regression or binary_classification
-            y_true = df_raw[outcome_cols[0]].values[supervised_mask]
-            y_pred = ensemble_preds[supervised_mask]
+            y_true = df_raw[outcome_cols[0]].values[_scorable_mask]
+            y_pred = ensemble_preds[_scorable_mask]
 
             for m_name in metrics_to_calc:
                 fn = get_scoring_function(m_name)
@@ -461,7 +455,7 @@ def main():
 
         # Permutation test
         print("\n--- Permutation Test (Model vs Chance) ---")
-        n_perm = n_boot
+        n_perm = max(n_boot, 1000)
         seed = config["execution"]["random_seed"]
 
         if task == "multi_regression":
@@ -477,9 +471,9 @@ def main():
                           f"p={row['p_value']:.4f} {sig}")
         else:
             if task == "multiclass_classification":
-                perm_preds = np.argmax(ensemble_preds[supervised_mask], axis=1)
+                perm_preds = np.argmax(ensemble_preds[_scorable_mask], axis=1)
             else:
-                perm_preds = ensemble_preds[supervised_mask]
+                perm_preds = ensemble_preds[_scorable_mask]
 
             perm_fns = []
             perm_names = []

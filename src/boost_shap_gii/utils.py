@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import importlib.util
 import json
 import os
@@ -125,6 +124,57 @@ def save_json_atomic(data: Any, path: str):
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_path, path)
+
+
+def load_dataframe(data_path: str) -> pd.DataFrame:
+    """Load a CSV or Parquet file and sanitize whitespace-only cells to NaN."""
+    if data_path.endswith('.csv'):
+        try:
+            df = pd.read_csv(data_path)
+        except (pd.errors.ParserError, ValueError, Exception):
+            print("[WARNING] Standard CSV parsing failed. Attempting auto-detection (sep=None, engine='python')...")
+            df = pd.read_csv(data_path, sep=None, engine='python')
+    else:
+        df = pd.read_parquet(data_path)
+    df = df.replace(r'^\s*$', pd.NA, regex=True)
+    return df
+
+
+def coerce_ordinal_column(series: pd.Series, levels: list, column_name: str) -> pd.Series:
+    """Coerce an ordinal column to integer codes with two-tier unknown-value validation.
+
+    Applies quote normalization, validates against known levels (hard error if >50%
+    of unique values are unknown; warning if >10% of observations are unknown),
+    and converts to ordered CategoricalDtype integer codes with NaN preservation.
+    """
+    levels = [_normalize_quotes(l) for l in levels]
+    series = series.map(lambda v: _normalize_quotes(v) if isinstance(v, str) else v)
+
+    unique_vals = series.dropna().unique()
+    unknowns = [v for v in unique_vals if v not in levels]
+    if unknowns:
+        unknown_frac = len(unknowns) / len(unique_vals)
+        if unknown_frac > 0.5:
+            raise ValueError(
+                f"Feature '{column_name}': {unknown_frac:.0%} of unique values not in YAML levels "
+                f"{levels}. Check for case mismatches or missing level definitions."
+            )
+        print(f"[WARNING] Feature '{column_name}': {len(unknowns)} unique value(s) not in YAML levels: {unknowns}")
+        obs_vals = series.dropna()
+        n_unknown_obs = sum(v not in levels for v in obs_vals)
+        obs_frac = n_unknown_obs / len(obs_vals) if len(obs_vals) > 0 else 0.0
+        if obs_frac > 0.10:
+            print(
+                f"[WARNING] Feature '{column_name}': {obs_frac:.1%} of non-missing observations "
+                f"({n_unknown_obs}/{len(obs_vals)}) have values not in YAML levels. "
+                f"This may indicate systematic data quality issues."
+            )
+
+    cat_type = pd.CategoricalDtype(categories=levels, ordered=True)
+    src = series.where(series.isin(levels) | series.isna(), other=pd.NA)
+    codes = src.astype(cat_type).cat.codes.astype("Int64")
+    codes[codes == -1] = pd.NA
+    return codes
 
 
 def detect_task(config: Dict) -> str:
@@ -928,10 +978,7 @@ def compute_permutation_test(y_true, y_pred, metric_fns, metric_names, n_perm, s
         except Exception:
             observed[name] = np.nan
 
-    # Null distributions — while-loop guarantees n_perm successful iterations.
-    # Unlike bootstraps (where single-class failure is diagnostic), permutation
-    # failures are rare numerical artifacts with no diagnostic value: retry is
-    # statistically valid because permutations preserve the full y distribution.
+    # While-loop retries to n_perm successes; permutation failures are non-diagnostic (see docstring).
     null_dists = {name: [] for name in metric_names}
     n_attempts = 0
     max_attempts = 2 * n_perm

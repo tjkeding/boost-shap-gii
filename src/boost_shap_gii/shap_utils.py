@@ -41,24 +41,19 @@ Statistical Assumptions
 from __future__ import annotations
 
 import os
-import sys
 import json
 import warnings
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import Dict, Any, List, Optional, Tuple
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
-import yaml
-import joblib
-
 from catboost import CatBoostRegressor, CatBoostClassifier, Pool
 from scipy.interpolate import LSQUnivariateSpline, LSQBivariateSpline
-from scipy import stats
 from statsmodels.stats.multitest import multipletests
 from joblib import Parallel, delayed
 
-from .utils import detect_task, is_regression, _block_permute_shadow
+from .utils import is_regression, _block_permute_shadow
 
 # -----------------------------------------------------------------------------
 # 1. IO & Helpers
@@ -93,27 +88,20 @@ def _to_numeric_matrix(df: pd.DataFrame) -> np.ndarray:
     df_num = df.copy()
     for col in df_num.columns:
         if df_num[col].dtype.name == 'category':
-            # Already categorical; extract codes directly (no redundant re-cast)
             codes = df_num[col].cat.codes
-            max_code = codes.max()
-            # NaN (-1 in cat.codes) -> max_code + 1 as distinct sentinel level
-            codes = codes.where(codes != -1, max_code + 1)
-            df_num[col] = codes
         elif pd.api.types.is_string_dtype(df_num[col]):
             codes = df_num[col].astype('category').cat.codes
-            max_code = codes.max()
-            # NaN (-1 in cat.codes) -> max_code + 1 as distinct sentinel level
-            codes = codes.where(codes != -1, max_code + 1)
-            df_num[col] = codes
         elif df_num[col].dtype == object:
-            # Fallback for object-dtype columns missed by is_string_dtype
-            # (e.g., mixed types with None in pandas >= 3.0.1)
             codes = df_num[col].astype('category').cat.codes
-            max_code = codes.max()
-            codes = codes.where(codes != -1, max_code + 1)
-            df_num[col] = codes
-        df_num[col] = df_num[col].astype(float)
-
+        else:
+            df_num[col] = df_num[col].astype(float)
+            if df_num[col].isnull().any():
+                df_num[col] = df_num[col].fillna(0.0)
+            continue
+        # NaN (-1 in cat.codes) -> max_code + 1 as distinct sentinel level
+        max_code = codes.max()
+        codes = codes.where(codes != -1, max_code + 1)
+        df_num[col] = codes.astype(float)
         if df_num[col].isnull().any():
             df_num[col] = df_num[col].fillna(0.0)
 
@@ -219,15 +207,9 @@ def _check_spline_energy_stability_1d(y_raw: np.ndarray, y_spline: np.ndarray) -
     if tv_raw == 0:
         return True if tv_spline < 1e-9 else False
 
-    # Energy-gate tolerance: the 0.1% multiplier (1.001) is an empirical balance
-    # margin. Pure machine epsilon for float64 (~2.2e-16), compounded through N
-    # spline-evaluation operations, produces relative errors typically around
-    # 1e-10 to 1e-8 — well below 1e-3. The 0.1% threshold is loose enough to
-    # avoid false fails from splev rounding plus diff/sum cancellation, and tight
-    # enough to catch genuine spline overshoot indicative of basis instability.
-    # This is an empirical heuristic, not a formal numerical analysis result;
-    # see Higham (2002), *Accuracy and Stability of Numerical Algorithms*, ch. 1
-    # for the role of empirical tolerances in numerical software design.
+    # 0.1% tolerance margin (empirical, not a formal error bound; see Higham 2002 ch. 1
+    # on empirical tolerances in numerical software). Loose enough to absorb spline
+    # rounding/cancellation noise (~1e-8), tight enough to catch genuine overshoot.
     if tv_spline > (tv_raw * 1.001):
         return False
 
@@ -256,15 +238,9 @@ def _check_spline_energy_stability_2d(x1: np.ndarray, x2: np.ndarray, y_raw: np.
     if tv_raw_total == 0:
         return True if tv_spline_total < 1e-9 else False
 
-    # Energy-gate tolerance: the 0.1% multiplier (1.001) is an empirical balance
-    # margin. Pure machine epsilon for float64 (~2.2e-16), compounded through N
-    # spline-evaluation operations, produces relative errors typically around
-    # 1e-10 to 1e-8 — well below 1e-3. The 0.1% threshold is loose enough to
-    # avoid false fails from splev rounding plus diff/sum cancellation, and tight
-    # enough to catch genuine spline overshoot indicative of basis instability.
-    # This is an empirical heuristic, not a formal numerical analysis result;
-    # see Higham (2002), *Accuracy and Stability of Numerical Algorithms*, ch. 1
-    # for the role of empirical tolerances in numerical software design.
+    # 0.1% tolerance margin (empirical, not a formal error bound; see Higham 2002 ch. 1
+    # on empirical tolerances in numerical software). Loose enough to absorb spline
+    # rounding/cancellation noise (~1e-8), tight enough to catch genuine overshoot.
     if tv_spline_total > (tv_raw_total * 1.001):
         return False
 

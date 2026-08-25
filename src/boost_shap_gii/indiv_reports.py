@@ -56,11 +56,11 @@ import json
 import os
 import re
 import warnings
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from catboost import CatBoost, CatBoostClassifier, CatBoostRegressor, Pool
+from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 from sklearn.model_selection import KFold
 
 from .utils import get_cv_splitter, save_json_atomic
@@ -280,23 +280,11 @@ def _bootstrap_of_cv_inference(
     point_shap_main: np.ndarray,
     point_shap_int: Optional[np.ndarray],
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-    """Bootstrap-of-CV with basic/reverse-percentile intervals for inference mode.
+    """Bootstrap-of-CV basic/reverse-percentile CIs for inference mode.
 
-    For each iteration b in {1, ..., B}:
-      1. Draw a bootstrap sample s_b of size N_train from (X_train, y_train).
-      2. Generate a fresh K-fold split on s_b (independent of the original training split;
-         seed = random_seed + b + 1) using get_cv_splitter for uniform/stratified strategies,
-         or KFold fallback for group CV (bootstrap resampling breaks group structure).
-      3. For each fold k: refit a CatBoost model on the fold-train portion of s_b using
-         fold_hyperparameters[k] (no HP retuning).
-      4. Compute SHAP main and (when point_shap_int is not None) interaction values from
-         each refitted fold model on inference_pool, then average across K fold models to
-         produce one ensemble-replicate.
-    After B iterations, compute the basic/reverse-percentile interval at each cell:
-      ci_lo = 2 * hat - q_hi
-      ci_hi = 2 * hat - q_lo
-    where (q_lo, q_hi) are the (2.5, 97.5) percentiles of the bootstrap distribution and
-    hat is the original deployed ensemble-mean point estimate.
+    See the module docstring for the full algorithm. Briefly: draw s_b, refit K folds
+    on s_b using frozen fold_hyperparameters, average SHAP across folds per iteration,
+    then ci_lo/hi = 2*hat - q_hi/lo over the B ensemble-replicates.
 
     Parameters
     ----------
@@ -660,6 +648,8 @@ def orchestrate_bootstrap_cache(
     config: dict,
     n_jobs: int,
     random_seed: int,
+    *,
+    cluster_ids: Optional[np.ndarray] = None,
 ) -> dict:
     """Build the coupled bootstrap-refit cache at run_dir/bootstrap_refits/.
 
@@ -691,20 +681,11 @@ def orchestrate_bootstrap_cache(
     # 2. Preload all K original fold models and extract user-level HP dicts
     params: List[dict] = []
     for k, mpath in enumerate(model_files):
-        if task in ("regression", "multi_regression"):
-            m = CatBoostRegressor()
-        else:
-            m = CatBoostClassifier()
-        m.load_model(mpath)
+        m = _load_one_model(mpath, task)
         params.append(_extract_user_level_params(m.get_all_params()))
     print(f"[INFO] Loaded HP from {K} fold models.")
 
     # 3. Draw shared bootstrap index vectors for all B iterations
-    cluster_ids = None
-    cluster_col = config.get("data", {}).get("cluster_id_col")
-    if cluster_col and cluster_col in X_train.columns:
-        cluster_ids = X_train[cluster_col].values
-
     rng = np.random.default_rng(random_seed)
     shared_indices_list = []
     for b in range(B):
@@ -742,6 +723,8 @@ def orchestrate_bootstrap_cache(
     else:
         np.save(y_tmp, y_train.values)
         np.save(y_persistent, y_train.values)
+    if cluster_ids is not None:
+        np.save(os.path.join(cache_dir, "cluster_ids.npy"), cluster_ids)
     print(f"[INFO] Serialized training data for worker processes.")
 
     # 4. Dispatch K * B refits to process pool
@@ -825,6 +808,8 @@ def generate_indiv_reports(
     mode: Literal["training", "inference"],
     sig_GII_main: Dict[str, bool],
     sig_GII_interaction: Dict[Tuple[str, str], bool],
+    *,
+    cluster_ids: Optional[np.ndarray] = None,
 ) -> None:
     """Compute per-individual SHAP point estimates + coupled-bootstrap CIs and emit parquets.
 
@@ -874,10 +859,7 @@ def generate_indiv_reports(
     npz = np.load(npz_path, allow_pickle=True)
     shared_indices_arr = npz["indices"]
     # Reconstruct list (handles both ragged and rectangular)
-    if shared_indices_arr.dtype == object:
-        shared_indices_list = [shared_indices_arr[b] for b in range(B)]
-    else:
-        shared_indices_list = [shared_indices_arr[b] for b in range(B)]
+    shared_indices_list = [shared_indices_arr[b] for b in range(B)]
 
     # --- Load original K fold models for point estimates ---
     orig_model_files = sorted(glob.glob(os.path.join(train_dir, "model_fold_*.cbm")))
@@ -1029,11 +1011,11 @@ def generate_indiv_reports(
             )
         y_train_arr = np.load(y_train_npy_path, allow_pickle=False)
 
-        # Resolve cluster_ids from config and X_train column (mirrors orchestrate_bootstrap_cache).
-        infer_cluster_ids: Optional[np.ndarray] = None
-        cluster_col = config.get("data", {}).get("cluster_id_col")
-        if cluster_col and cluster_col in X_train.columns:
-            infer_cluster_ids = X_train[cluster_col].values
+        cluster_ids_path = os.path.join(cache_dir, "cluster_ids.npy")
+        infer_cluster_ids = (
+            np.load(cluster_ids_path, allow_pickle=False)
+            if os.path.exists(cluster_ids_path) else None
+        )
 
         # Frozen fold-specific HPs from the K deployed model_fold_k.cbm files.
         frozen_hps: List[dict] = [

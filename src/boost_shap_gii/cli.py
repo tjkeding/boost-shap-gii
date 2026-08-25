@@ -70,6 +70,13 @@ def cmd_plot(args: argparse.Namespace) -> None:
     """
     from .check_env import run_preflight
     run_preflight()
+
+    import yaml
+    from .utils import validate_plot_config
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+    validate_plot_config(config)
+
     plot_r_path = _find_plot_r()
 
     cmd = [
