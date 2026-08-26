@@ -6,14 +6,11 @@ draw ONE shared bootstrap sample s_b (size N, with replacement, cluster-aware wh
 cluster_ids present); for each fold k in range(K) refit CatBoost on (X_train[s_b],
 y_train[s_b]) using params_k = get_all_params(model_fold_{k}.cbm). Total refits = K * B.
 
-Inference mode: bootstrap-of-CV design. Per iteration b: draw one bootstrap sample
-s_b (size N_train, with replacement, cluster-aware when cluster_ids present); generate a
-fresh K-fold split on s_b via get_cv_splitter (respecting cv_strategy for uniform/stratified;
-falling back to KFold for group CV because bootstrap resampling breaks group structure;
-seed = random_seed + b + 1); for each
-fold k refit CatBoost on the fold-train portion of s_b using frozen fold_hyperparameters[k]
-(no HP retuning); compute SHAP on the inference pool from each of the K refits and average
-to produce ONE ensemble-replicate per b. CIs are basic/reverse-percentile intervals:
+Inference mode: cached-model bootstrap. Per iteration b: load the K pre-cached bootstrap
+refit models from bootstrap_refits/iter_{b}/fold_{k}.cbm (built by orchestrate_bootstrap_cache
+in predict.py); compute SHAP on the inference pool from each of the K refits and average to
+produce ONE ensemble-replicate per b. All B replicates are valid for every inference individual
+(no OOB filtering). CIs are basic/reverse-percentile intervals:
   ci_lo = 2 * hat - q_hi,  ci_hi = 2 * hat - q_lo
 where hat is the deployed ensemble-mean point estimate and (q_lo, q_hi) are bootstrap
 percentiles. This aligns the bootstrap estimand with the deployed ensemble estimand.
@@ -52,18 +49,18 @@ from __future__ import annotations
 import concurrent.futures
 import datetime
 import glob
+import importlib.util
 import json
 import os
 import re
 import warnings
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, CatBoostRegressor, Pool
-from sklearn.model_selection import KFold
 
-from .utils import get_cv_splitter, save_json_atomic
+from .utils import save_json_atomic
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -262,163 +259,6 @@ def _bootstrap_sample_indices(
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap-of-CV inference CI routine
-# ---------------------------------------------------------------------------
-
-def _bootstrap_of_cv_inference(
-    X_train: pd.DataFrame,
-    y_train: np.ndarray,
-    inference_pool: Pool,
-    fold_hyperparameters: List[dict],
-    B: int,
-    K: int,
-    random_seed: int,
-    cluster_ids: Optional[np.ndarray],
-    task: str,
-    nom_feats: List[str],
-    config: dict,
-    point_shap_main: np.ndarray,
-    point_shap_int: Optional[np.ndarray],
-) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-    """Bootstrap-of-CV basic/reverse-percentile CIs for inference mode.
-
-    See the module docstring for the full algorithm. Briefly: draw s_b, refit K folds
-    on s_b using frozen fold_hyperparameters, average SHAP across folds per iteration,
-    then ci_lo/hi = 2*hat - q_hi/lo over the B ensemble-replicates.
-
-    Parameters
-    ----------
-    X_train : pd.DataFrame
-        Training feature matrix (N_train rows).
-    y_train : np.ndarray
-        Training outcome array (1D or 2D).
-    inference_pool : Pool
-        CatBoost Pool for the inference target individuals.
-    fold_hyperparameters : list of dict
-        Frozen fold-specific HPs extracted from the K deployed model_fold_k.cbm files.
-    B : int
-        Number of bootstrap iterations.
-    K : int
-        Number of CV folds (must match len(fold_hyperparameters)).
-    random_seed : int
-        Base random seed for the bootstrap RNG.
-    cluster_ids : np.ndarray or None
-        Cluster membership vector (length N_train). When provided, resampling is
-        cluster-aware (mirrors _bootstrap_sample_indices convention).
-    task : str
-        One of 'regression', 'multi_regression', 'binary_classification',
-        'multiclass_classification'.
-    nom_feats : list of str
-        Nominal feature names for CatBoost Pool construction.
-    point_shap_main : np.ndarray
-        Deployed ensemble-mean SHAP main values, shape (N_target, C, F).
-    point_shap_int : np.ndarray or None
-        Deployed ensemble-mean SHAP interaction values, shape (N_target, C, F, F), or
-        None when interaction CIs are not requested.
-
-    Returns
-    -------
-    main_ci_lo, main_ci_hi : np.ndarray, each shape (N_target, C, F)
-    int_ci_lo, int_ci_hi : np.ndarray or None, each shape (N_target, C, F, F)
-    """
-    rng = np.random.default_rng(random_seed)
-    N_train = len(X_train)
-    N_target = point_shap_main.shape[0]
-    C = point_shap_main.shape[1]
-    F = point_shap_main.shape[2]
-
-    main_replicates = np.full((B, N_target, C, F), np.nan, dtype=np.float32)
-    compute_interactions = point_shap_int is not None
-    if compute_interactions:
-        int_replicates = np.full((B, N_target, C, F, F), np.nan, dtype=np.float32)
-    else:
-        int_replicates = None
-
-    is_cls = task in ("binary_classification", "multiclass_classification")
-
-    for b in range(B):
-        s_b_idx = _bootstrap_sample_indices(N=N_train, rng=rng, cluster_ids=cluster_ids)
-        X_b = X_train.iloc[s_b_idx].reset_index(drop=True)
-        if y_train.ndim == 1:
-            y_b = y_train[s_b_idx]
-        else:
-            y_b = y_train[s_b_idx, :]
-
-        # Fresh K-fold split on s_b; seed decoupled from s_b draw.
-        fold_seed = random_seed + b + 1
-        cv_strategy = config.get("modeling", {}).get("cv_strategy", "uniform")
-        if cv_strategy == "group":
-            splitter = KFold(n_splits=K, shuffle=True, random_state=fold_seed)
-            fold_iter = list(splitter.split(X_b))
-        else:
-            y_b_series = pd.Series(y_b) if y_b.ndim == 1 else pd.Series(y_b[:, 0])
-            splitter = get_cv_splitter(
-                config, y_b_series, seed_override=fold_seed, n_folds_override=K,
-            )
-            fold_iter = list(splitter.split(X_b, y_b_series))
-
-        per_fold_main = np.full((K, N_target, C, F), np.nan, dtype=np.float32)
-        if compute_interactions:
-            per_fold_int = np.full((K, N_target, C, F, F), np.nan, dtype=np.float32)
-
-        for k, (train_idx, _) in enumerate(fold_iter):
-            X_fold_train = X_b.iloc[train_idx].reset_index(drop=True)
-            if y_b.ndim == 1:
-                y_fold_train = y_b[train_idx]
-            else:
-                y_fold_train = y_b[train_idx, :]
-
-            refit_params = dict(fold_hyperparameters[k])
-            refit_params["thread_count"] = 1
-            refit_params["verbose"] = False
-            refit_params["allow_writing_files"] = False
-
-            fold_train_pool = Pool(X_fold_train, label=y_fold_train, cat_features=nom_feats)
-
-            if task in ("regression", "multi_regression"):
-                refit_model = CatBoostRegressor(**refit_params)
-            else:
-                refit_model = CatBoostClassifier(**refit_params)
-            refit_model.fit(fold_train_pool)
-
-            per_fold_main[k] = _shap_single(refit_model, inference_pool, task, N_target)
-            if compute_interactions:
-                per_fold_int[k] = _shap_interaction_single(refit_model, inference_pool)
-
-        main_replicates[b] = np.nanmean(per_fold_main, axis=0)
-        if compute_interactions:
-            int_replicates[b] = np.nanmean(per_fold_int, axis=0)
-
-        # Release per-iteration fold arrays
-        del per_fold_main
-        if compute_interactions:
-            del per_fold_int
-
-        if (b + 1) % max(1, B // 10) == 0:
-            print(f"[INFO] Bootstrap-of-CV inference: {b + 1}/{B} iterations complete.")
-
-    alpha = 0.05
-    q_lo_pct = (alpha / 2) * 100.0
-    q_hi_pct = (1.0 - alpha / 2) * 100.0
-
-    main_q_lo = np.nanpercentile(main_replicates, q_lo_pct, axis=0)
-    main_q_hi = np.nanpercentile(main_replicates, q_hi_pct, axis=0)
-    main_ci_lo = 2.0 * point_shap_main - main_q_hi
-    main_ci_hi = 2.0 * point_shap_main - main_q_lo
-
-    if compute_interactions:
-        int_q_lo = np.nanpercentile(int_replicates, q_lo_pct, axis=0)
-        int_q_hi = np.nanpercentile(int_replicates, q_hi_pct, axis=0)
-        int_ci_lo = 2.0 * point_shap_int - int_q_hi
-        int_ci_hi = 2.0 * point_shap_int - int_q_lo
-    else:
-        int_ci_lo = None
-        int_ci_hi = None
-
-    return main_ci_lo, main_ci_hi, int_ci_lo, int_ci_hi
-
-
-# ---------------------------------------------------------------------------
 # Worker function for ProcessPoolExecutor (must be module-level for pickling)
 # ---------------------------------------------------------------------------
 
@@ -432,17 +272,41 @@ def _fit_and_save_refit(
     nom_feats: list,
     task: str,
     out_path: str,
-) -> None:
-    """Fit one bootstrap refit model and save it.
+    df_raw_parquet_path: str = None,
+    transform_module_path: str = None,
+    tx_params: dict = None,
+    outcome_col=None,
+    back_transform_shap: bool = False,
+    is_affine: bool = False,
+) -> float:
+    """Fit one bootstrap refit model and save it; return affine scale factor alpha.
 
-    Loads X_train and y_train from parquet (avoids passing large DataFrames to workers).
+    Loads X_train and y_train from serialized files (avoids passing large
+    DataFrames to workers). When transform_module_path is provided, fits
+    input_transform on the bootstrap resample to produce per-iteration
+    transformed y (matching the per-fold re-estimation structure of the
+    deployed models). When back_transform_shap and is_affine are both True,
+    probes output_transform to compute and return the per-bootstrap alpha
+    (constant scale factor); otherwise returns 1.0.
     """
     X_train = pd.read_parquet(X_train_parquet_path)
-    y_arr = np.load(y_train_path, allow_pickle=True)
-    if y_arr.ndim == 1:
-        y_boot = y_arr[sample_indices]
+
+    if transform_module_path is not None:
+        df_raw = pd.read_parquet(df_raw_parquet_path)
+        spec = importlib.util.spec_from_file_location("_transforms", transform_module_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        y_boot, _, boot_meta = mod.input_transform(
+            df_raw, sample_indices, sample_indices, outcome_col, tx_params or {}
+        )
+        if not isinstance(y_boot, np.ndarray):
+            y_boot = np.asarray(y_boot, dtype=float)
     else:
-        y_boot = y_arr[sample_indices, :]
+        y_arr = np.load(y_train_path, allow_pickle=True)
+        if y_arr.ndim == 1:
+            y_boot = y_arr[sample_indices]
+        else:
+            y_boot = y_arr[sample_indices, :]
 
     X_boot = X_train.iloc[sample_indices]
 
@@ -461,6 +325,27 @@ def _fit_and_save_refit(
     m.fit(pool)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     m.save_model(out_path)
+
+    if back_transform_shap and is_affine and transform_module_path is not None:
+        probe_0 = np.zeros(len(sample_indices))
+        probe_1 = np.ones(len(sample_indices))
+        ot_0 = np.asarray(mod.output_transform(
+            probe_0, boot_meta, tx_params or {},
+            df_raw=df_raw, row_indices=sample_indices
+        ), dtype=float)
+        ot_1 = np.asarray(mod.output_transform(
+            probe_1, boot_meta, tx_params or {},
+            df_raw=df_raw, row_indices=sample_indices
+        ), dtype=float)
+        alpha_vec = ot_1 - ot_0
+        if not np.allclose(alpha_vec, alpha_vec[0], rtol=1e-6):
+            raise ValueError(
+                f"Bootstrap refit (b={b}, k={k}): output_transform has "
+                f"non-constant slope across samples. "
+                f"Range: [{alpha_vec.min():.8f}, {alpha_vec.max():.8f}]."
+            )
+        return float(alpha_vec[0])
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +535,12 @@ def orchestrate_bootstrap_cache(
     random_seed: int,
     *,
     cluster_ids: Optional[np.ndarray] = None,
+    transform_module_path: Optional[str] = None,
+    tx_params: Optional[dict] = None,
+    df_raw: Optional[pd.DataFrame] = None,
+    outcome_col=None,
+    back_transform_shap: bool = False,
+    is_affine: bool = False,
 ) -> dict:
     """Build the coupled bootstrap-refit cache at run_dir/bootstrap_refits/.
 
@@ -674,6 +565,7 @@ def orchestrate_bootstrap_cache(
             "Run train.py before building bootstrap cache."
         )
     K = len(model_files)
+    boot_alphas = np.ones((B, K), dtype=np.float64)
     N_train = len(X_train)
 
     print(f"[INFO] orchestrate_bootstrap_cache: K={K}, B={B}, total_refits={K * B}")
@@ -712,7 +604,6 @@ def orchestrate_bootstrap_cache(
     print(f"[INFO] Saved shared bootstrap indices ({B} iterations) to {npz_path}.")
 
     # Serialize X_train and y_train to temp files for worker processes.
-    # y_train is also persisted permanently as y_train.npy for inference-mode bootstrap-of-CV.
     x_tmp = os.path.join(cache_dir, "_X_train_tmp.parquet")
     y_tmp = os.path.join(cache_dir, "_y_train_tmp.npy")
     y_persistent = os.path.join(cache_dir, "y_train.npy")
@@ -727,6 +618,12 @@ def orchestrate_bootstrap_cache(
         np.save(os.path.join(cache_dir, "cluster_ids.npy"), cluster_ids)
     print(f"[INFO] Serialized training data for worker processes.")
 
+    df_raw_tmp = None
+    if transform_module_path is not None and df_raw is not None:
+        df_raw_tmp = os.path.join(cache_dir, "_df_raw_tmp.parquet")
+        df_raw.to_parquet(df_raw_tmp)
+        print(f"[INFO] Serialized df_raw for per-bootstrap transforms.")
+
     # 4. Dispatch K * B refits to process pool
     max_workers = max(1, int(n_jobs))
 
@@ -735,7 +632,9 @@ def orchestrate_bootstrap_cache(
             s = shared_indices_list[b]
             for k in range(K):
                 out_path = os.path.join(cache_dir, f"iter_{b:05d}", f"fold_{k}.cbm")
-                yield (b, k, s, params[k], x_tmp, y_tmp, nom_feats, task, out_path)
+                yield (b, k, s, params[k], x_tmp, y_tmp, nom_feats, task, out_path,
+                       df_raw_tmp, transform_module_path, tx_params, outcome_col,
+                       back_transform_shap, is_affine)
 
     tasks = list(_make_tasks())
     total = len(tasks)
@@ -745,27 +644,36 @@ def orchestrate_bootstrap_cache(
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                _fit_and_save_refit, b, k, s, p, x_tmp, y_tmp, nom_feats, task, out
+                _fit_and_save_refit, b, k, s, p, x_tmp, y_tmp, nom_feats, task, out,
+                df_raw_p, tx_mod_p, tx_par, oc, bts, ia
             ): (b, k)
-            for b, k, s, p, _, _, _, _, out in tasks
+            for b, k, s, p, _, _, _, _, out, df_raw_p, tx_mod_p, tx_par, oc, bts, ia in tasks
         }
         for fut in concurrent.futures.as_completed(futures):
             b_idx, k_idx = futures[fut]
             try:
-                fut.result()
+                boot_alpha = fut.result()
             except Exception as exc:
                 raise RuntimeError(
                     f"Bootstrap refit failed at iteration b={b_idx}, fold k={k_idx}: {exc}"
                 ) from exc
+            boot_alphas[b_idx, k_idx] = boot_alpha
             completed += 1
             if completed % max(1, total // 10) == 0:
                 print(f"[INFO] Bootstrap refits: {completed}/{total} complete.")
 
     print(f"[INFO] All {total} bootstrap refits complete.")
 
+    if back_transform_shap and is_affine:
+        alphas_path = os.path.join(cache_dir, "bootstrap_alphas.npy")
+        np.save(alphas_path, boot_alphas)
+        n_unique = len(set(boot_alphas.ravel()))
+        print(f"[INFO] Saved per-bootstrap alphas ({B}x{K} matrix, "
+              f"{n_unique} distinct values) to {alphas_path}.")
+
     # Cleanup temp files
-    for tmp in (x_tmp, y_tmp):
-        if os.path.exists(tmp):
+    for tmp in (x_tmp, y_tmp, df_raw_tmp):
+        if tmp is not None and os.path.exists(tmp):
             os.remove(tmp)
 
     # 5. Write bootstrap_metadata.json
@@ -779,6 +687,7 @@ def orchestrate_bootstrap_cache(
         "random_seed": random_seed,
         "cluster_aware": cluster_ids is not None,
         "fold_hp_summary": {str(k): params[k] for k in range(K)},
+        "bootstrap_alphas_saved": back_transform_shap and is_affine,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
     }
     save_json_atomic(meta, os.path.join(cache_dir, "bootstrap_metadata.json"))
@@ -799,7 +708,7 @@ def generate_indiv_reports(
     train_dir: str,
     X_target: pd.DataFrame,
     ids_target: pd.Series,
-    X_train: pd.DataFrame,
+    X_train: Optional[pd.DataFrame],
     y_target: Optional[Union[pd.Series, pd.DataFrame]],
     task: str,
     outcome_cols: list,
@@ -810,6 +719,11 @@ def generate_indiv_reports(
     sig_GII_interaction: Dict[Tuple[str, str], bool],
     *,
     cluster_ids: Optional[np.ndarray] = None,
+    transform_module: Optional[Any] = None,
+    fold_transform_metadata: Optional[List[dict]] = None,
+    tx_params: Optional[dict] = None,
+    df_raw: Optional[pd.DataFrame] = None,
+    fold_shap_scale_factors: Optional[List[float]] = None,
 ) -> None:
     """Compute per-individual SHAP point estimates + coupled-bootstrap CIs and emit parquets.
 
@@ -820,7 +734,10 @@ def generate_indiv_reports(
       - train_dir/train_outcome_stats.json exists.
       - train_dir/model_fold_*.cbm exist.
       In training mode: X_train and y_target (== y_train) must be provided.
+      In inference mode: X_train is not required.
     """
+    if mode == "training" and X_train is None:
+        raise ValueError("X_train is required in training mode.")
     nboot = int(config["shap"]["indiv_ci_nboot"])
     if nboot == 0:
         return
@@ -836,6 +753,23 @@ def generate_indiv_reports(
     K = cache_meta["K"]
     B = cache_meta["B"]
     cache_dir = os.path.join(train_dir, "bootstrap_refits")
+
+    boot_alphas = None
+    if fold_shap_scale_factors is not None:
+        alphas_path = os.path.join(cache_dir, "bootstrap_alphas.npy")
+        if not os.path.exists(alphas_path):
+            raise FileNotFoundError(
+                f"bootstrap_alphas.npy not found at {alphas_path}. "
+                "The bootstrap cache was built without per-refit alpha "
+                "computation. Re-run predict.py with the current version "
+                "to rebuild the cache with per-bootstrap scale factors."
+            )
+        boot_alphas = np.load(alphas_path)
+        if boot_alphas.shape != (B, K):
+            raise ValueError(
+                f"bootstrap_alphas.npy shape {boot_alphas.shape} does not match "
+                f"expected (B={B}, K={K}). Re-run predict.py to rebuild."
+            )
 
     N_target = len(X_target)
     feature_names = list(X_target.columns)
@@ -938,6 +872,15 @@ def generate_indiv_reports(
             pool_fold = Pool(X_fold, cat_features=cat_feats)
             sv = _shap_single(orig_models[k], pool_fold, task, X_fold.shape[0])  # (n_fold, C, F)
             pv = _predict_single(orig_models[k], pool_fold, task)
+            if fold_shap_scale_factors is not None:
+                sv = (sv.astype(np.float64) * fold_shap_scale_factors[k]).astype(np.float32)
+            if (transform_module is not None and fold_transform_metadata is not None
+                    and task in ("regression", "multi_regression")):
+                pv = transform_module.output_transform(
+                    np.asarray(pv, dtype=float), fold_transform_metadata[k],
+                    tx_params or {},
+                    df_raw=df_raw, row_indices=np.where(fold_mask)[0],
+                )
             point_shap[fold_mask] = sv
             point_y_pred[fold_mask] = pv
 
@@ -957,7 +900,17 @@ def generate_indiv_reports(
         for k in range(K):
             sv = _shap_single(orig_models[k], pool_all, task, N_target)  # (N, C, F)
             pv = _predict_single(orig_models[k], pool_all, task)
-            shap_accum += sv
+            if (transform_module is not None and fold_transform_metadata is not None
+                    and task in ("regression", "multi_regression")):
+                pv = transform_module.output_transform(
+                    np.asarray(pv, dtype=float), fold_transform_metadata[k],
+                    tx_params or {},
+                    df_raw=df_raw, row_indices=np.arange(N_target),
+                )
+            if fold_shap_scale_factors is not None:
+                shap_accum += sv.astype(np.float64) * fold_shap_scale_factors[k]
+            else:
+                shap_accum += sv
             pred_accum += pv
 
         point_shap = (shap_accum / K).astype(np.float32)
@@ -981,13 +934,18 @@ def generate_indiv_reports(
                 X_fold = X_target.iloc[np.where(fold_mask)[0]]
                 pool_fold = Pool(X_fold, cat_features=cat_feats)
                 sv_int = _shap_interaction_single(orig_models[k], pool_fold)  # (n_fold, C, F, F)
+                if fold_shap_scale_factors is not None:
+                    sv_int = (sv_int.astype(np.float64) * fold_shap_scale_factors[k]).astype(np.float32)
                 point_shap_int[fold_mask] = sv_int
         else:
             int_accum = np.zeros((N_target, n_classes, N_features, N_features), dtype=np.float64)
             pool_all = Pool(X_target, cat_features=cat_feats)
             for k in range(K):
                 sv_int = _shap_interaction_single(orig_models[k], pool_all)  # (N, C, F, F)
-                int_accum += sv_int
+                if fold_shap_scale_factors is not None:
+                    int_accum += sv_int.astype(np.float64) * fold_shap_scale_factors[k]
+                else:
+                    int_accum += sv_int
             point_shap_int = (int_accum / K).astype(np.float32)
     else:
         point_shap_int = None
@@ -996,75 +954,89 @@ def generate_indiv_reports(
     # --- STEP 4: CI computation (design differs by mode) ---
 
     if mode == "inference":
-        # Bootstrap-of-CV: draw fresh bootstrap samples and K-fold splits per iteration.
-        # CIs are basic/reverse-percentile intervals anchored on the original ensemble
-        # point estimate. No pre-built refit cache is used for inference CIs.
-        print(f"[INFO] Bootstrap-of-CV inference CI: {B} iterations, K={K} folds each...")
+        # Inference-mode CI: load pre-cached B x K bootstrap refit models (built by
+        # orchestrate_bootstrap_cache in predict.py). Average SHAP across K folds per
+        # iteration to produce B ensemble-replicates, then compute basic/reverse-percentile
+        # CIs anchored on the deployed ensemble point estimate.
+        print(f"[INFO] Accumulating bootstrap CI distributions from {B} iterations (inference mode)...")
 
-        # Load y_train from the persistent cache artifact written by orchestrate_bootstrap_cache.
-        y_train_npy_path = os.path.join(cache_dir, "y_train.npy")
-        if not os.path.exists(y_train_npy_path):
-            raise FileNotFoundError(
-                f"y_train.npy not found at {y_train_npy_path}. "
-                "Re-run predict.py with shap.indiv_ci_nboot > 0 to rebuild the bootstrap cache. "
-                "This artifact is required for inference-mode bootstrap-of-CV CI computation."
+        main_replicates = np.full((B, N_target, n_classes, N_features), np.nan, dtype=np.float32)
+        if compute_interactions:
+            int_replicates = np.full(
+                (B, N_target, n_classes, N_features, N_features), np.nan, dtype=np.float32
             )
-        y_train_arr = np.load(y_train_npy_path, allow_pickle=False)
+        else:
+            int_replicates = None
 
-        cluster_ids_path = os.path.join(cache_dir, "cluster_ids.npy")
-        infer_cluster_ids = (
-            np.load(cluster_ids_path, allow_pickle=False)
-            if os.path.exists(cluster_ids_path) else None
-        )
+        pool_tgt = Pool(X_target, cat_features=cat_feats)
 
-        # Frozen fold-specific HPs from the K deployed model_fold_k.cbm files.
-        frozen_hps: List[dict] = [
-            _extract_user_level_params(m.get_all_params()) for m in orig_models
-        ]
-        frozen_hps = _probe_and_strip_refit_params(frozen_hps, task)
+        for b in range(B):
+            boot_models = []
+            for k in range(K):
+                bp = os.path.join(cache_dir, f"iter_{b:05d}", f"fold_{k}.cbm")
+                boot_models.append(_load_one_model(bp, task))
 
-        # Build the inference Pool for SHAP computation inside bootstrap-of-CV.
-        pool_infer_tgt = Pool(X_target, cat_features=cat_feats)
+            shap_iter_folds = np.zeros((K, N_target, n_classes, N_features), dtype=np.float32)
+            for k in range(K):
+                sv_k = _shap_single(boot_models[k], pool_tgt, task, N_target)
+                if boot_alphas is not None:
+                    shap_iter_folds[k] = (sv_k.astype(np.float64) * boot_alphas[b, k]).astype(np.float32)
+                else:
+                    shap_iter_folds[k] = sv_k
 
-        random_seed_cfg = int(config.get("execution", {}).get("random_seed", 42))
+            main_replicates[b] = np.mean(shap_iter_folds, axis=0)
 
-        main_ci_lo_inf, main_ci_hi_inf, int_ci_lo_inf, int_ci_hi_inf = (
-            _bootstrap_of_cv_inference(
-                X_train=X_train,
-                y_train=y_train_arr,
-                inference_pool=pool_infer_tgt,
-                fold_hyperparameters=frozen_hps,
-                B=B,
-                K=K,
-                random_seed=random_seed_cfg,
-                cluster_ids=infer_cluster_ids,
-                task=task,
-                nom_feats=nom_feats,
-                config=config,
-                point_shap_main=point_shap,
-                point_shap_int=point_shap_int if compute_interactions else None,
-            )
-        )
-        print("[INFO] Bootstrap-of-CV inference CI computation complete.")
+            if compute_interactions:
+                int_iter_folds = np.zeros(
+                    (K, N_target, n_classes, N_features, N_features), dtype=np.float32
+                )
+                for k in range(K):
+                    sv_int_k = _shap_interaction_single(boot_models[k], pool_tgt)
+                    if boot_alphas is not None:
+                        int_iter_folds[k] = (sv_int_k.astype(np.float64) * boot_alphas[b, k]).astype(np.float32)
+                    else:
+                        int_iter_folds[k] = sv_int_k
+                int_replicates[b] = np.mean(int_iter_folds, axis=0)
 
-        # Wrap CI arrays in per-individual accessor helpers compatible with
-        # the output-row construction block below.  oob_counts = B for all individuals
-        # (basic/reverse-percentile uses all B replicates; no OOB filtering needed).
+            del boot_models
+
+            if (b + 1) % max(1, B // 10) == 0:
+                print(f"[INFO] CI accumulation: {b + 1}/{B} iterations complete.")
+
+        alpha = 0.05
+        q_lo_pct = (alpha / 2) * 100.0
+        q_hi_pct = (1.0 - alpha / 2) * 100.0
+
+        main_q_lo = np.nanpercentile(main_replicates, q_lo_pct, axis=0)
+        main_q_hi = np.nanpercentile(main_replicates, q_hi_pct, axis=0)
+        main_ci_lo_inf = 2.0 * point_shap.astype(np.float64) - main_q_hi
+        main_ci_hi_inf = 2.0 * point_shap.astype(np.float64) - main_q_lo
+
+        if compute_interactions and int_replicates is not None:
+            int_q_lo = np.nanpercentile(int_replicates, q_lo_pct, axis=0)
+            int_q_hi = np.nanpercentile(int_replicates, q_hi_pct, axis=0)
+            int_ci_lo_inf = 2.0 * point_shap_int.astype(np.float64) - int_q_hi
+            int_ci_hi_inf = 2.0 * point_shap_int.astype(np.float64) - int_q_lo
+        else:
+            int_ci_lo_inf = None
+            int_ci_hi_inf = None
+
+        del main_replicates
+        if int_replicates is not None:
+            del int_replicates
+
+        print("[INFO] CI accumulation complete. Computing percentile CIs...")
+
         oob_counts = np.full(N_target, B, dtype=np.int32)
 
         def _compute_ci_inf_main(i: int):
-            """Return (ci_lo, ci_hi) for individual i's main SHAP values."""
-            return main_ci_lo_inf[i], main_ci_hi_inf[i]  # each shape (C, F)
+            return main_ci_lo_inf[i], main_ci_hi_inf[i]
 
         def _compute_ci_inf_int(i: int):
-            """Return (ci_lo, ci_hi) for individual i's interaction values, or (None, None)."""
             if int_ci_lo_inf is None:
                 return None, None
-            return int_ci_lo_inf[i], int_ci_hi_inf[i]  # each shape (C, F, F)
+            return int_ci_lo_inf[i], int_ci_hi_inf[i]
 
-        # Placeholder pred CI: inference-mode does not compute prediction CIs via
-        # bootstrap-of-CV (SHAP CIs are the primary deliverable per the CR plan).
-        # Emit NaN bounds consistently so the predictions parquet schema is preserved.
         def _compute_ci_inf_pred(i: int):
             return None, None
 
@@ -1121,7 +1093,10 @@ def generate_indiv_reports(
             for k in range(K):
                 sv_k = _shap_single(boot_models[k], pool_tgt, task, N_target)  # (N, C, F)
                 pv_k = _predict_single(boot_models[k], pool_tgt, task).astype(np.float32)
-                shap_iter_folds[k] = sv_k
+                if boot_alphas is not None:
+                    shap_iter_folds[k] = (sv_k.astype(np.float64) * boot_alphas[b, k]).astype(np.float32)
+                else:
+                    shap_iter_folds[k] = sv_k
                 pred_iter_folds[k] = pv_k
 
             if compute_interactions:
@@ -1131,7 +1106,10 @@ def generate_indiv_reports(
                 )
                 for k in range(K):
                     sv_int_k = _shap_interaction_single(boot_models[k], pool_tgt)  # (N, C, F, F)
-                    int_iter_folds[k] = sv_int_k
+                    if boot_alphas is not None:
+                        int_iter_folds[k] = (sv_int_k.astype(np.float64) * boot_alphas[b, k]).astype(np.float32)
+                    else:
+                        int_iter_folds[k] = sv_int_k
             else:
                 int_iter_folds = None
 
@@ -1180,6 +1158,20 @@ def generate_indiv_reports(
 
     ids_list = list(ids_target)
     X_raw = X_target  # raw feature values (already in pre-encoding form or we use as-is)
+
+    if fold_shap_scale_factors is not None:
+        n_unique_fold = len(set(fold_shap_scale_factors))
+        if n_unique_fold == 1:
+            print(f"[INFO] Scaled individual SHAP values by "
+                  f"shap_scale_factor={fold_shap_scale_factors[0]:.6f} (uniform)")
+        else:
+            print(f"[INFO] Scaled individual SHAP values by per-fold "
+                  f"shap_scale_factors ({n_unique_fold} distinct values)")
+        if boot_alphas is not None:
+            n_unique_boot = len(set(boot_alphas.ravel()))
+            print(f"[INFO] Scaled bootstrap CI SHAP values by per-refit "
+                  f"alphas ({boot_alphas.shape[0]}x{boot_alphas.shape[1]} matrix, "
+                  f"{n_unique_boot} distinct values)")
 
     main_rows = []
     pred_rows = []

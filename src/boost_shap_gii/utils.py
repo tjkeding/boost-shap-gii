@@ -622,6 +622,20 @@ def load_transform_module(config: dict):
     return module
 
 
+def resolve_transform_path(config: dict) -> Optional[str]:
+    """Resolve the absolute file path to the user's transform module.
+
+    Returns None if no transformations block is present in config.
+    """
+    if "transformations" not in config:
+        return None
+    raw_path = config["transformations"]["file"]
+    if not os.path.isabs(raw_path):
+        base = config.get("data", {}).get("data_dir", os.getcwd())
+        return os.path.join(base, raw_path)
+    return raw_path
+
+
 def validate_transform_config(required_cols: list, df, stage: str) -> None:
     """Validate that all required transformation columns are present in the dataframe.
 

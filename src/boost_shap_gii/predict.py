@@ -26,6 +26,7 @@ from .utils import (
     compute_permutation_test,
     validate_indiv_reports_config,
     load_transform_module,
+    resolve_transform_path,
     coerce_ordinal_column,
 )
 
@@ -231,12 +232,19 @@ def main():
     tx_config_path = os.path.join(run_dir, "transform_config.json")
     transform_module = None
     tx_info = None
-    shap_scale_factor = 1.0
+    fold_shap_scale_factors = None
     if os.path.exists(tx_config_path):
         with open(tx_config_path) as f:
             tx_info = json.load(f)
         if tx_info.get("active", False):
             transform_module = load_transform_module(config)
+            if transform_module is None:
+                raise ValueError(
+                    "transform_config.json indicates active transforms but "
+                    "load_transform_module returned None. Verify the config "
+                    "YAML contains a valid transformations block matching "
+                    "the training config."
+                )
             required_cols = tx_info.get("required_cols", [])
             if required_cols:
                 missing = [c for c in required_cols if c not in df_raw.columns]
@@ -245,11 +253,25 @@ def main():
                         f"[predict] transformations.required_cols missing from "
                         f"dataframe: {missing}"
                     )
-            shap_scale_factor = tx_info.get("shap_scale_factor", 1.0)
+            if tx_info.get("back_transform_shap", False):
+                if "fold_shap_scale_factors" not in tx_info:
+                    raise ValueError(
+                        "transform_config.json uses the legacy single-scalar "
+                        "shap_scale_factor format. Re-run train.py with the current "
+                        "version to regenerate per-fold scale factors."
+                    )
+                fold_shap_scale_factors = tx_info["fold_shap_scale_factors"]
             print(f"[INFO] Transformations active (file: {tx_info['file']})")
             ftm_path = os.path.join(run_dir, "fold_transform_metadata.json")
             with open(ftm_path) as f:
                 _fold_transform_meta = json.load(f)
+            if not is_regression(task):
+                raise ValueError(
+                    f"Outcome transformations are only supported for regression tasks "
+                    f"(regression, multi_regression). Detected task: '{task}'. "
+                    f"The input_transform/output_transform API contract assumes a "
+                    f"continuous, invertible outcome transformation."
+                )
 
     for fold_idx in range(n_folds):
         val_idx = np.where(fold_assignments == fold_idx)[0]
@@ -472,8 +494,8 @@ def main():
         shap_ctx["groups"] = df_raw[group_column].values
         shap_ctx["cv_strategy"] = cv_strategy
 
-    if shap_scale_factor != 1.0:
-        shap_ctx["shap_scale_factor"] = shap_scale_factor
+    if fold_shap_scale_factors is not None:
+        shap_ctx["fold_shap_scale_factors"] = fold_shap_scale_factors
 
     run_shap_pipeline(shap_ctx)
 
@@ -490,6 +512,13 @@ def main():
         if cv_strategy == "group" and group_column is not None and group_column in df_raw.columns:
             cluster_ids_indiv = df_raw[group_column].values
 
+        # Resolve transform module path for per-bootstrap transforms
+        tx_module_path = None
+        _outcome_col_boot = None
+        if transform_module is not None:
+            tx_module_path = resolve_transform_path(config)
+            _outcome_col_boot = outcome_cols[0] if len(outcome_cols) == 1 else outcome_cols
+
         # 1. Build cache at run_dir/bootstrap_refits/
         cache_summary = orchestrate_bootstrap_cache(
             run_dir=run_dir,
@@ -502,6 +531,12 @@ def main():
             n_jobs=n_jobs,
             random_seed=config["execution"]["random_seed"],
             cluster_ids=cluster_ids_indiv,
+            transform_module_path=tx_module_path,
+            tx_params=tx_info.get("params", {}) if tx_info is not None else None,
+            df_raw=df_raw if transform_module is not None else None,
+            outcome_col=_outcome_col_boot,
+            back_transform_shap=tx_info.get("back_transform_shap", False) if tx_info else False,
+            is_affine=tx_info.get("is_affine", False) if tx_info else False,
         )
         print(
             f"[INFO] Bootstrap cache built: B={cache_summary['B']} iterations "
@@ -526,6 +561,11 @@ def main():
             sig_GII_main=sig_GII_main,
             sig_GII_interaction=sig_GII_interaction,
             cluster_ids=cluster_ids_indiv,
+            transform_module=transform_module,
+            fold_transform_metadata=_fold_transform_meta if transform_module is not None else None,
+            tx_params=tx_info.get("params", {}) if tx_info is not None else None,
+            df_raw=df_raw,
+            fold_shap_scale_factors=fold_shap_scale_factors,
         )
         print(f"[INFO] Training indiv_reports/ emitted to {run_dir}.")
     else:

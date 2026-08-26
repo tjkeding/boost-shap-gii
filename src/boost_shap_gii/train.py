@@ -899,6 +899,14 @@ def main():
     task = detect_task(config)
     loss_func = config["modeling"]["loss_function"]
 
+    if transform_module is not None and not is_regression(task):
+        raise ValueError(
+            f"Outcome transformations are only supported for regression tasks "
+            f"(regression, multi_regression). Detected task: '{task}'. "
+            f"The input_transform/output_transform API contract assumes a "
+            f"continuous, invertible outcome transformation."
+        )
+
     if is_classification(task):
         y_class = y if isinstance(y, pd.Series) else y.iloc[:, 0]
         class_counts = y_class.value_counts()
@@ -1016,9 +1024,6 @@ def main():
             )
             y_train = pd.Series(y_train, index=y.iloc[train_idx].index)
             y_val = pd.Series(y_val, index=y.iloc[val_idx].index)
-            all_fold_transform_meta.append(fold_meta)
-
-        if transform_module is not None and fold_idx == 0:
             if tx_cfg.get("back_transform_shap", False) and is_affine:
                 probe_0 = np.zeros(len(val_idx))
                 probe_1 = np.ones(len(val_idx))
@@ -1033,14 +1038,16 @@ def main():
                 alpha_vec = ot_1 - ot_0
                 if not np.allclose(alpha_vec, alpha_vec[0], rtol=1e-6):
                     raise ValueError(
-                        "back_transform_shap=true but output_transform has "
-                        "non-constant slope across samples in fold 0. "
-                        "This indicates a sample-dependent scale factor."
+                        f"back_transform_shap=true but output_transform has "
+                        f"non-constant slope across samples in fold {fold_idx}. "
+                        f"This indicates a sample-dependent scale factor."
                     )
-                shap_scale_factor = float(alpha_vec[0])
-                print(f"[INFO] SHAP scale factor (alpha) = {shap_scale_factor:.6f}")
+                fold_alpha = float(alpha_vec[0])
             else:
-                shap_scale_factor = 1.0
+                fold_alpha = 1.0
+            fold_meta["_pipeline_alpha"] = fold_alpha
+            all_fold_transform_meta.append(fold_meta)
+            save_json_atomic(all_fold_transform_meta, os.path.join(run_dir, "fold_transform_metadata.json"))
 
         # --- PHASE 1: CLEAN TRAINING ---
         # A. Tune
@@ -1088,6 +1095,7 @@ def main():
             oof_preds.iloc[val_idx] = preds
 
         # D. Log Metrics
+        scale_label = " [transformed scale]" if transform_module is not None else ""
         y_true_fold = y_val.values
         if task == "multi_regression" and target_scaler is not None:
             y_true_fold = target_scaler.inverse_transform(
@@ -1098,7 +1106,7 @@ def main():
             mae = mean_absolute_error(y_true_fold, preds)
             r2 = r2_score(y_true_fold, preds)
             metrics = {"rmse": rmse, "mae": mae, "r2": r2}
-            print(f"  > Scores: RMSE={rmse:.3f}, R2={r2:.3f}")
+            print(f"  > Scores{scale_label}: RMSE={rmse:.3f}, R2={r2:.3f}")
         elif task == "multi_regression":
             # Per-target RMSE + overall mean
             metrics = {}
@@ -1108,7 +1116,7 @@ def main():
                 metrics[f"rmse_{col}"] = t_rmse
                 metrics[f"r2_{col}"] = t_r2
             metrics["rmse_mean"] = np.mean([metrics[f"rmse_{c}"] for c in outcome_cols])
-            print(f"  > Scores: Mean RMSE={metrics['rmse_mean']:.3f}")
+            print(f"  > Scores{scale_label}: Mean RMSE={metrics['rmse_mean']:.3f}")
         elif task == "multiclass_classification":
             from sklearn.metrics import balanced_accuracy_score as bas
             acc = bas(y_true_fold, preds_labels)
@@ -1116,20 +1124,27 @@ def main():
             try:
                 auc = roc_auc_score(y_true_fold, proba, multi_class='ovr', average='weighted')
                 metrics["roc_auc_ovr"] = auc
-                print(f"  > Scores: Balanced Acc={acc:.3f}, AUC-OVR={auc:.3f}")
+                print(f"  > Scores{scale_label}: Balanced Acc={acc:.3f}, AUC-OVR={auc:.3f}")
             except ValueError:
-                print(f"  > Scores: Balanced Acc={acc:.3f} (AUC-OVR skipped)")
+                print(f"  > Scores{scale_label}: Balanced Acc={acc:.3f} (AUC-OVR skipped)")
         else:  # binary_classification
             try:
                 auc = roc_auc_score(y_true_fold, preds)
-                print(f"  > Scores: AUC={auc:.3f}")
+                print(f"  > Scores{scale_label}: AUC={auc:.3f}")
                 metrics = {"auc": auc}
             except ValueError:
                 acc = accuracy_score(y_true_fold, (np.array(preds) > 0.5).astype(int))
-                print(f"  > Scores: ACC={acc:.3f} (AUC Failed)")
+                print(f"  > Scores{scale_label}: ACC={acc:.3f} (AUC Failed)")
                 metrics = {"acc": acc}
 
         fold_metrics.append(metrics)
+
+        # Back-transform OOF predictions to raw scale for the saved CSV artifact
+        if transform_module is not None and fold_meta is not None and is_regression(task):
+            oof_preds.iloc[val_idx] = transform_module.output_transform(
+                np.asarray(preds, dtype=float), fold_meta, tx_cfg.get("params", {}),
+                df_raw=df_raw, row_indices=val_idx
+            )
 
         # E. Save Clean Model
         model_path = os.path.join(run_dir, f"model_fold_{fold_idx}.cbm")
@@ -1191,6 +1206,16 @@ def main():
     print("\n[INFO] CV Complete. Saving Global Artifacts...")
     save_json_atomic(fold_assignments.tolist(), os.path.join(run_dir, "fold_assignments.json"))
 
+    if transform_module is not None and len(all_fold_transform_meta) > 0:
+        fold_alphas = [fm.get("_pipeline_alpha", 1.0) for fm in all_fold_transform_meta]
+        if len(fold_alphas) > 1:
+            fa_arr = np.array(fold_alphas)
+            cv_pct = float(np.std(fa_arr, ddof=1) / np.mean(fa_arr) * 100)
+            print(f"[INFO] Per-fold shap_scale_factors: "
+                  f"{[round(a, 6) for a in fold_alphas]}, CV={cv_pct:.2f}%")
+        else:
+            print(f"[INFO] shap_scale_factor={fold_alphas[0]:.6f} (single fold)")
+
     if transform_module is not None:
         tx_artifact = {
             "active": True,
@@ -1199,12 +1224,11 @@ def main():
             "required_cols": tx_cfg.get("required_cols", []),
             "is_affine": is_affine,
             "back_transform_shap": tx_cfg.get("back_transform_shap", False),
-            "shap_scale_factor": shap_scale_factor,
+            "fold_shap_scale_factors": fold_alphas,
         }
         save_json_atomic(tx_artifact, os.path.join(run_dir, "transform_config.json"))
         print(f"[INFO] Saved transform_config.json")
-        save_json_atomic(all_fold_transform_meta, os.path.join(run_dir, "fold_transform_metadata.json"))
-        print(f"[INFO] Saved fold_transform_metadata.json ({len(all_fold_transform_meta)} folds)")
+        print(f"[INFO] fold_transform_metadata.json finalized ({len(all_fold_transform_meta)} folds)")
 
     # We include ID if available in raw, else just index
     id_col = "id" if "id" in df_raw.columns else "index"

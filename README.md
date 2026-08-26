@@ -240,7 +240,7 @@ Before training begins, the pipeline runs an automatic smoke test on a small sub
 
 ### SHAP Back-Transformation
 
-When `back_transform_shap: true`, the pipeline additionally verifies that the transform is affine (via a linear-regression check during the smoke test) and, if so, rescales SHAP values by the transform's constant scale factor so that M, V, and GII are reported in original-outcome units. The pipeline halts with an error if `back_transform_shap: true` is requested for a transform found to be non-affine, since SHAP additivity does not survive a nonlinear back-transformation.
+When `back_transform_shap: true`, the pipeline additionally verifies that the transform is affine (via a linear-regression check during the smoke test) and, if so, rescales SHAP values by each fold's own constant scale factor (`alpha`) so that M, V, and GII are reported in original-outcome units. For data-dependent affine transforms (e.g., z-score standardization where sigma is estimated from the training partition), each fold may produce a legitimately different alpha; the pipeline applies each fold's alpha only to the rows that fold produced, rather than using a single global scalar. Bootstrap CI refits compute their own exact alpha from the refit's own fitted transform parameters. The pipeline halts with an error if `back_transform_shap: true` is requested for a transform found to be non-affine, since SHAP additivity does not survive a nonlinear back-transformation.
 
 ### Interactions with Other Features
 

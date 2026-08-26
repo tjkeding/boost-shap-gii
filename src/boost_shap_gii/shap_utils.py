@@ -958,7 +958,7 @@ def _run_bootstrap_pipeline(
     ids: pd.Series,
     cluster_ids: Optional[np.ndarray] = None,
     X_display: Optional[pd.DataFrame] = None,
-    shap_scale_factor: float = 1.0,
+    shap_scale_factors: Optional[np.ndarray] = None,
     inference_mode: bool = False,
 ) -> pd.DataFrame:
 
@@ -968,12 +968,18 @@ def _run_bootstrap_pipeline(
 
     SHAP_vals_shadow = df_shap_shadow.values if not df_shap_shadow.empty else None
 
-    if shap_scale_factor != 1.0:
-        SHAP_vals = SHAP_vals * shap_scale_factor
+    if shap_scale_factors is not None:
+        SHAP_vals = SHAP_vals * shap_scale_factors[:, np.newaxis]
         if SHAP_vals_shadow is not None:
-            SHAP_vals_shadow = SHAP_vals_shadow * shap_scale_factor
-        print(f"[SHAP] Scaled SHAP values by alpha={shap_scale_factor:.6f} "
-              f"(back_transform_shap=true)")
+            SHAP_vals_shadow = SHAP_vals_shadow * shap_scale_factors[:, np.newaxis]
+        n_unique = len(set(float(x) for x in shap_scale_factors))
+        if n_unique == 1:
+            print(f"[SHAP] Scaled SHAP values by alpha={shap_scale_factors[0]:.6f} "
+                  f"(back_transform_shap=true, uniform across folds)")
+        else:
+            print(f"[SHAP] Scaled SHAP values by per-fold alpha "
+                  f"(back_transform_shap=true, {len(shap_scale_factors)} rows, "
+                  f"{n_unique} distinct values)")
 
     # For microdata: extract real-feature columns from X_full
     real_feature_names = [n for n in feature_names if not n.startswith("shadow_")]
@@ -1372,7 +1378,7 @@ def _run_shap_for_slice(
     X_raw = ctx.get("X_raw", None)
     ids = ctx.get("ids", None)
     n_jobs = config["execution"]["n_jobs"]
-    shap_scale_factor = ctx.get("shap_scale_factor", 1.0)
+    fold_shap_scale_factors = ctx.get("fold_shap_scale_factors", None)
 
     label_str = f" [slice={slice_label}]" if slice_label else ""
     mode_str = "Inference" if inference_mode else "OOF"
@@ -1488,6 +1494,17 @@ def _run_shap_for_slice(
 
     all_feature_names = list(X_stacked.columns)
 
+    shap_scale_factors = None
+    if fold_shap_scale_factors is not None:
+        fsf = np.array(fold_shap_scale_factors, dtype=float)
+        if inference_mode:
+            N_obs = len(X_aligned)
+            shap_scale_factors = np.repeat(fsf, N_obs)
+        else:
+            fold_assignments_arr = ctx.get("_fold_assignments")
+            if fold_assignments_arr is not None:
+                shap_scale_factors = fsf[fold_assignments_arr]
+
     _run_bootstrap_pipeline(
         df_shap_real, df_shap_shadow,
         X_stacked,
@@ -1501,7 +1518,7 @@ def _run_shap_for_slice(
         X_raw, ids,
         cluster_ids=cluster_ids,
         X_display=chunks_X[0] if inference_mode else None,
-        shap_scale_factor=shap_scale_factor,
+        shap_scale_factors=shap_scale_factors,
         inference_mode=inference_mode,
     )
 
@@ -1562,6 +1579,7 @@ def run_shap_pipeline(ctx: Dict[str, Any]) -> None:
         fold_assignments_path = os.path.join(train_dir, "fold_assignments.json")
         with open(fold_assignments_path) as f:
             fold_assignments = np.array(json.load(f))
+        ctx["_fold_assignments"] = fold_assignments
         n_folds = int(fold_assignments.max()) + 1
         splits = []
         for k in range(n_folds):

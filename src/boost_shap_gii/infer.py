@@ -224,12 +224,19 @@ def main():
     tx_config_path = os.path.join(train_dir, "transform_config.json")
     transform_module = None
     tx_info = None
-    shap_scale_factor = 1.0
+    fold_shap_scale_factors = None
     if os.path.exists(tx_config_path):
         with open(tx_config_path) as f:
             tx_info = json.load(f)
         if tx_info.get("active", False):
             transform_module = load_transform_module(config)
+            if transform_module is None:
+                raise ValueError(
+                    "transform_config.json indicates active transforms but "
+                    "load_transform_module returned None. Verify the config "
+                    "YAML contains a valid transformations block matching "
+                    "the training config."
+                )
             required_cols = tx_info.get("required_cols", [])
             if required_cols:
                 missing = [c for c in required_cols if c not in df_raw.columns]
@@ -238,8 +245,22 @@ def main():
                         f"[infer] transformations.required_cols missing from "
                         f"dataframe: {missing}"
                     )
-            shap_scale_factor = tx_info.get("shap_scale_factor", 1.0)
+            if tx_info.get("back_transform_shap", False):
+                if "fold_shap_scale_factors" not in tx_info:
+                    raise ValueError(
+                        "transform_config.json uses the legacy single-scalar "
+                        "shap_scale_factor format. Re-run train.py with the current "
+                        "version to regenerate per-fold scale factors."
+                    )
+                fold_shap_scale_factors = tx_info["fold_shap_scale_factors"]
             print(f"[INFO] Transformations active (file: {tx_info['file']})")
+            if not is_regression(task):
+                raise ValueError(
+                    f"Outcome transformations are only supported for regression tasks "
+                    f"(regression, multi_regression). Detected task: '{task}'. "
+                    f"The input_transform/output_transform API contract assumes a "
+                    f"continuous, invertible outcome transformation."
+                )
 
     if transform_module is not None:
         fold_meta_path = os.path.join(train_dir, "fold_transform_metadata.json")
@@ -553,8 +574,8 @@ def main():
         "inference_mode": True,
     }
 
-    if shap_scale_factor != 1.0:
-        shap_ctx["shap_scale_factor"] = shap_scale_factor
+    if fold_shap_scale_factors is not None:
+        shap_ctx["fold_shap_scale_factors"] = fold_shap_scale_factors
 
     if config["shap"].get("compute_global_on_inference", False):
         run_shap_pipeline(shap_ctx)
@@ -577,15 +598,6 @@ def main():
         # sig_GII is a property of the trained model; always load from train_dir
         sig_GII_main, sig_GII_interaction = _load_sig_GII_from_shap_stats(train_dir)
 
-        # Load X_train from train_dir for OOB accounting consistency
-        train_matrix_path = os.path.join(train_dir, "train_matrix.parquet")
-        if not os.path.exists(train_matrix_path):
-            raise FileNotFoundError(
-                f"train_matrix.parquet not found in {train_dir}. "
-                "Run train.py and predict.py before invoking infer.py with indiv_reports."
-            )
-        X_train = pd.read_parquet(train_matrix_path)
-
         # Construct y_infer for y_target (None if outcomes absent)
         if has_outcomes:
             if len(outcome_cols) > 1:
@@ -600,7 +612,7 @@ def main():
             train_dir=train_dir,
             X_target=X,
             ids_target=ids,
-            X_train=X_train,
+            X_train=None,
             y_target=y_infer,
             task=task,
             outcome_cols=outcome_cols,
@@ -609,6 +621,15 @@ def main():
             mode="inference",
             sig_GII_main=sig_GII_main,
             sig_GII_interaction=sig_GII_interaction,
+            transform_module=transform_module,
+            fold_transform_metadata=(
+                _fold_transform_meta if transform_module is not None else None
+            ),
+            tx_params=(
+                tx_info.get("params", {}) if tx_info is not None else None
+            ),
+            df_raw=df_raw,
+            fold_shap_scale_factors=fold_shap_scale_factors,
         )
         print(f"[INFO] Inference indiv_reports/ emitted to {infer_dir}.")
     else:

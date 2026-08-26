@@ -310,7 +310,7 @@ Top-level config block (sibling of `shap` and `aggregate_shap`). Defines an opti
 | `file` | str | Yes | — | Path to a Python transform script. Relative paths are resolved against `data.data_dir`. The script must define `input_transform` and `output_transform` functions. |
 | `params` | dict | No | `{}` | Arbitrary parameters passed verbatim to both `input_transform` and `output_transform`. |
 | `required_cols` | list[str] | No | `[]` | Column names from `df_raw` required by `output_transform`. Validated at train, predict, and infer time; raises `ValueError` if any listed column is absent. |
-| `back_transform_shap` | bool | No | `false` | When `true`, SHAP values are scaled by the affine transform's constant scale factor (`alpha`) to report in original-scale units. Requires `output_transform` to be affine; the pipeline halts with an error if this condition is not met. |
+| `back_transform_shap` | bool | No | `false` | When `true`, SHAP values are scaled by each fold's own affine constant scale factor (`alpha`) to report in original-scale units. For data-dependent affine transforms (e.g., z-score where sigma varies across folds), each fold's SHAP contributions are scaled by that fold's alpha. Bootstrap CI refits compute their own exact alpha from the refit's fitted transform parameters. Requires `output_transform` to be affine; the pipeline halts with an error if this condition is not met. |
 
 **Transform function API contract**
 
@@ -336,7 +336,7 @@ Written by `train.py` at the end of training; consumed by `predict.py` and `infe
 | `required_cols` | list | The `transformations.required_cols` list (empty list when omitted). |
 | `is_affine` | bool | `true` if the smoke test determined the transform to be affine. |
 | `back_transform_shap` | bool | Mirror of `transformations.back_transform_shap`. |
-| `shap_scale_factor` | float | The affine constant scale factor (`alpha`) used to rescale SHAP values when `back_transform_shap: true`; `1.0` when `back_transform_shap: false` or the transform is non-affine. |
+| `fold_shap_scale_factors` | list[float] | Per-fold affine constant scale factors (`alpha`), one entry per CV fold (length K). Each fold's alpha is computed from that fold's own training partition by probing `output_transform` with zero/one vectors. Used to rescale SHAP values when `back_transform_shap: true`. Absent when `back_transform_shap: false` or the transform is non-affine. For fixed-parameter affine transforms, all entries are identical; for data-dependent affine transforms (e.g., z-score standardization), entries may differ across folds. |
 
 **`fold_transform_metadata.json` inter-stage artifact**
 
@@ -643,6 +643,7 @@ output_dir/
 │       └── <rank>_<effect>_GII.png
 ├── bootstrap_refits/             # Per-individual CI cache (only when indiv_ci_nboot > 0)
 │   ├── bootstrap_metadata.json  # Design summary: K, B, random_seed, HP per fold
+│   ├── bootstrap_alphas.npy     # Per-refit alpha (B×K); only when back_transform_shap
 │   ├── shared_indices.npz       # Bootstrap sample index matrix, shape (B, N_train)
 │   ├── iter_00000/
 │   │   ├── fold_0.cbm           # Bootstrap-refitted CatBoost models (one per fold)
@@ -1039,7 +1040,12 @@ contains one entry per outcome column. SD is unbiased (ddof = 1). Consumed by
 
 Present only when `indiv_ci_nboot > 0`. Contains:
 - `bootstrap_metadata.json`: design summary (K, B, total_refits, random_seed, cluster_aware,
-  per-fold HP summary, ISO8601 timestamp).
+  per-fold HP summary, `bootstrap_alphas_saved` flag, ISO8601 timestamp).
+- `bootstrap_alphas.npy` (present only when `back_transform_shap: true` and the transform
+  is affine): float64 array of shape (B, K) containing the exact per-bootstrap-refit affine
+  scale factor. Each entry `bootstrap_alphas[b, k]` is the alpha computed from bootstrap
+  iteration b's refit of fold k's model, using that bootstrap resample's own fitted
+  transform parameters. Consumed by `generate_indiv_reports` for per-refit CI scaling.
 - `shared_indices.npz`: numpy archive containing the (B, N_train) int32 index matrix (one
   row per iteration, encoding which training rows were included in that iteration's bootstrap
   sample).

@@ -443,7 +443,58 @@ LLM tool use carries no claim to scientific credit under project policy. All sco
 
 ---
 
+### Session 2026-08-26 -- Per-fold SHAP scaling fix (P0)
+
+**Date:** 2026-08-26
+
+**Session scope:**
+
+- **P0 fix: per-fold SHAP scaling architecture**: the cross-fold `shap_scale_factor` logic in `train.py` was mis-specified in two compounding ways. First, an `rtol=1e-6` cross-fold consistency gate could not be satisfied by legitimate finite-sample estimates of data-dependent scale parameters (e.g., per-fold sigma in z-score standardization, where the asymptotic SE of a sample standard deviation at n=40 yields a CV of approximately 11%). Second, even if relaxed, `shap_scale_factor = fold_alphas[0]` applied one arbitrarily-chosen fold's alpha uniformly to all rows, which is incorrect for rows originating from any other fold when fold-level alphas differ. The fix replaced the single-scalar architecture with per-fold scaling: `transform_config.json` now stores `fold_shap_scale_factors` (a list, one entry per CV fold) instead of `shap_scale_factor` (a single float). `shap_utils.py` constructs a per-row alpha vector indexed by fold assignment (predict mode) or by contiguous fold-block structure (inference mode). For bootstrap CI, each refit computes its own exact alpha by probing `output_transform` with the bootstrap resample's own fitted transform parameters, stored as `bootstrap_alphas.npy` (a B by K float64 array). This separates point-estimate scaling authority (fold alphas, exact for the original fold model) from CI scaling authority (per-bootstrap alphas, exact for each refit's transform parameters). The mathematical basis is SHAP linearity under affine transformation (Lundberg and Lee 2017, Theorem 1: efficiency axiom plus chain rule): for `output_transform g^{-1}(p) = alpha * p + beta`, `SHAP_original = alpha * SHAP_transformed`.
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for brainstorm and implementation plan structuring.
+- Claude Sonnet 4.6 (Anthropic): used for code scaffolding under direction.
+- Claude Sonnet 5 (Anthropic): used for test design and execution, implementation of the six-change plan, documentation edits under direction.
+
+LLM tool use carries no claim to scientific credit under project policy. All scope decisions, the per-fold vs. single-scalar architectural choice, the exact-per-bootstrap-alpha design (rejecting a fold-alpha approximation), and plan approvals were made by the researcher.
+
+**Key decisions (researcher-approved):**
+
+- *Per-row fold-specific scaling (T1: A2)*: the only mathematically exact option (no approximation, no tolerance threshold), using data structures already in place (fold_assignments.json, fold_transform_metadata.json with _pipeline_alpha).
+- *Informational diagnostic instead of hard halt (T2: B2)*: per-fold alphas and their coefficient of variation are logged, but no halt threshold is imposed. Per-row scaling ensures correctness regardless of inter-fold alpha spread.
+- *Exact per-bootstrap alpha*: each bootstrap refit probes output_transform with the bootstrap resample's own fitted transform metadata, rather than reusing the original fold's alpha as an approximation. Rejects the O(1/sqrt(n_fold)) approximation error as inconsistent with the pipeline's zero-approximation design philosophy.
+- *Inference-mode data boundary preserved*: `infer.py` accesses only pre-computed artifacts from `train_dir` (models, JSON metadata, `bootstrap_alphas.npy`); no training data is accessed. `orchestrate_bootstrap_cache` is called exclusively from `predict.py`.
+
+**Test metrics:**
+
+- Pre-session (v1.5.1 baseline): 895 tests across 28 test files (862 passing, 1 failing, 32 errors). The 32 errors and 1 failure were the direct manifestation of the P0 bug (cross-fold alpha hard halt blocking the entire dry-run fixture).
+- Pre-design (after implement build, before test design): 906 tests (899 passing, 7 failing, 0 errors). The 32 errors resolved; 7 failures were obsolete-test re-expression targets (legacy `shap_scale_factor` API references).
+- Post-design: 914 tests (914 passing, 0 failing) across 28 test files. All 7 obsolete tests re-expressed (one strengthened to validate every fold's alpha, not just fold 0). 8 new tests cover the per-row alpha vector construction, the exact per-bootstrap alpha probe, the worker task-tuple threading, and a non-uniform per-fold alpha regression test targeting the original defect class.
+
+**Audit trail references (.aid/reports/):**
+
+- Brainstorm: `boost-shap-gii_brainstorm_20260826_181550.md`
+- Implementation plan: `boost-shap-gii_implement_plan_20260826_182259.md`
+- Implementation build: `boost-shap-gii_implement_build_20260826_191550.md`
+- Test reports: `boost-shap-gii_test_20260826_152600.md`, `boost-shap-gii_test_20260826_193443.md`
+- Document report: `boost-shap-gii_document_20260826_193443.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Version 1.6.0 -- 2026-08-26 (per-fold SHAP scaling P0 fix)
+
+Minor release fixing a P0 correctness bug in the cross-fold SHAP back-transformation architecture introduced in v1.5.0.
+
+- **Per-fold SHAP scaling (P0 fix)**: replaced the single-scalar `shap_scale_factor` (which applied one arbitrarily-chosen fold's alpha uniformly to all rows) with per-fold `fold_shap_scale_factors` (a list of per-CV-fold affine scale parameters). Each row of the pooled out-of-fold SHAP matrix is now scaled by the alpha from the fold that produced it. In inference mode, each fold model's SHAP values are scaled by that fold's alpha before cross-fold averaging. Mathematical basis: SHAP linearity under affine transformation (Lundberg and Lee, 2017, efficiency axiom combined with chain rule).
+- **Exact per-bootstrap alpha**: each bootstrap refit computes its own alpha by probing `output_transform` on that resample's fitted transform parameters, stored as `bootstrap_alphas.npy` (B x K float64 array). This eliminates the fold-alpha approximation that would have introduced O(1/sqrt(n_fold)) error relative to the true bootstrap-specific alpha.
+- **Informational CV% diagnostic**: the former `rtol=1e-6` hard halt (which could not be satisfied by legitimate finite-sample estimates of data-dependent scale parameters) was replaced with an informational coefficient-of-variation diagnostic printed at training time.
+- **Legacy format detection**: `predict.py` and `infer.py` raise `ValueError` if they encounter the retired `shap_scale_factor` (float) key in `transform_config.json`, directing users to retrain with v1.6.0+.
+- **Documentation**: README.md and INPUT_SPECIFICATION.md updated to reflect per-fold scaling, `bootstrap_alphas.npy` artifact, and `bootstrap_alphas_saved` metadata field.
+
+---
 
 ### Version 1.5.1 -- 2026-08-25 (required_cols NaN handling and codebase cleanup)
 
