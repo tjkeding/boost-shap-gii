@@ -34,6 +34,8 @@ def cmd_train(args: argparse.Namespace) -> None:
     from .check_env import run_preflight
     run_preflight()
     sys.argv = ["boost-shap-gii train", "--config", args.config]
+    if args.force_restart:
+        sys.argv.append("--force-restart")
     from .train import main
     main()
 
@@ -43,6 +45,8 @@ def cmd_predict(args: argparse.Namespace) -> None:
     from .check_env import run_preflight
     run_preflight()
     sys.argv = ["boost-shap-gii predict", "--config", args.config]
+    if args.force_restart:
+        sys.argv.append("--force-restart")
     from .predict import main
     main()
 
@@ -57,8 +61,97 @@ def cmd_infer(args: argparse.Namespace) -> None:
         "--data", args.data,
         "--output-subdir", args.output_subdir,
     ]
+    if args.force_restart:
+        sys.argv.append("--force-restart")
     from .infer import main
     main()
+
+
+def _backfill_perf_bootstrap(run_dir: str, config: dict) -> None:
+    """Generate bootstrap_distributions_perf.parquet from existing OOF predictions."""
+    import os
+    import numpy as np
+    import pandas as pd
+    import yaml
+
+    oof_path = os.path.join(run_dir, "predictions_oof.csv")
+    if not os.path.exists(oof_path):
+        print("[WARN] Cannot backfill performance bootstraps: predictions_oof.csv not found.")
+        return
+
+    resolved_cfg_path = os.path.join(run_dir, "resolved_config.yaml")
+    if os.path.exists(resolved_cfg_path):
+        with open(resolved_cfg_path) as f:
+            run_config = yaml.safe_load(f)
+    else:
+        run_config = config
+
+    from .utils import compute_bootstrap_ci, get_scoring_function
+    task = run_config["modeling"]["task_type"]
+    n_boot = run_config.get("shap", {}).get("bootstrapping", {}).get("n_boot", 2000)
+    boot_alpha = run_config.get("shap", {}).get("bootstrapping", {}).get("alpha", 0.05)
+
+    oof_df = pd.read_csv(oof_path)
+
+    if task == "regression":
+        metrics_to_calc = ["neg_rmse", "neg_mae", "r2"]
+    elif task == "multi_regression":
+        metrics_to_calc = ["neg_rmse", "neg_mae", "r2"]
+    elif task == "multiclass_classification":
+        metrics_to_calc = ["balanced_accuracy", "f1_weighted"]
+    else:
+        metrics_to_calc = ["roc_auc", "accuracy"]
+
+    boot_distributions = {}
+
+    if task == "multi_regression":
+        outcome_cols = [c.replace("y_true_", "") for c in oof_df.columns if c.startswith("y_true_")]
+        for col in outcome_cols:
+            y_true = oof_df[f"y_true_{col}"].values
+            y_pred = oof_df[f"y_pred_{col}"].values
+            for m_name in metrics_to_calc:
+                fn = get_scoring_function(m_name)
+                _, _, _, dist = compute_bootstrap_ci(
+                    y_true, y_pred, fn, n_boot=n_boot, alpha=boot_alpha,
+                    return_distribution=True
+                )
+                disp_name = f"{m_name.replace('neg_', '').upper()}_{col}"
+                boot_distributions[disp_name] = -dist if m_name.startswith("neg_") else dist
+    elif task == "multiclass_classification":
+        y_true = oof_df["y_true"].values
+        prob_cols = [c for c in oof_df.columns if c.startswith("prob_")]
+        preds_labels = np.argmax(oof_df[prob_cols].values, axis=1) if prob_cols else oof_df["y_pred"].values
+        for m_name in metrics_to_calc:
+            fn = get_scoring_function(m_name)
+            _, _, _, dist = compute_bootstrap_ci(
+                y_true, preds_labels, fn, n_boot=n_boot, alpha=boot_alpha,
+                return_distribution=True
+            )
+            boot_distributions[m_name.upper()] = dist
+    else:
+        y_true = oof_df["y_true"].values
+        y_pred = oof_df["y_pred"].values
+        for m_name in metrics_to_calc:
+            fn = get_scoring_function(m_name)
+            if task == "binary_classification" and m_name in ["accuracy", "f1"]:
+                fn = lambda yt, yp, _fn=fn: _fn(yt, (yp > 0.5).astype(int))
+            _, _, _, dist = compute_bootstrap_ci(
+                y_true, y_pred, fn, n_boot=n_boot, alpha=boot_alpha,
+                return_distribution=True
+            )
+            disp_name = m_name.replace("neg_", "").upper()
+            boot_distributions[disp_name] = -dist if m_name.startswith("neg_") else dist
+
+    if boot_distributions:
+        max_len = max(len(v) for v in boot_distributions.values())
+        boot_df = pd.DataFrame({
+            k: np.pad(v, (0, max_len - len(v)), constant_values=np.nan)
+            for k, v in boot_distributions.items()
+        })
+        boot_df.to_parquet(os.path.join(run_dir, "bootstrap_distributions_perf.parquet"), index=False)
+        print(f"[INFO] Backfilled bootstrap_distributions_perf.parquet ({len(boot_distributions)} metrics)")
+    else:
+        print("[WARN] No metrics computed for performance bootstrap backfill.")
 
 
 def cmd_plot(args: argparse.Namespace) -> None:
@@ -76,6 +169,15 @@ def cmd_plot(args: argparse.Namespace) -> None:
     with open(args.config) as f:
         config = yaml.safe_load(f)
     validate_plot_config(config)
+
+    import os
+    run_dir = args.run_dir if args.run_dir else config["paths"]["output_dir"]
+    boot_perf_path = os.path.join(run_dir, "bootstrap_distributions_perf.parquet")
+    if not os.path.exists(boot_perf_path):
+        try:
+            _backfill_perf_bootstrap(run_dir, config)
+        except Exception as e:
+            print(f"[WARN] Performance bootstrap backfill failed: {e}", file=sys.stderr)
 
     plot_r_path = _find_plot_r()
 
@@ -123,6 +225,7 @@ def main() -> None:
         help="Tune hyperparameters and train gradient boosting models.",
     )
     p_train.add_argument("--config", required=True, help="Path to config YAML.")
+    p_train.add_argument("--force-restart", action="store_true", help="Delete this stage's checkpoint and restart from scratch")
     p_train.set_defaults(func=cmd_train)
 
     # --- predict ---
@@ -131,6 +234,7 @@ def main() -> None:
         help="Evaluate trained models and compute SHAP-based GII.",
     )
     p_predict.add_argument("--config", required=True, help="Path to config YAML.")
+    p_predict.add_argument("--force-restart", action="store_true", help="Delete this stage's checkpoint and restart from scratch")
     p_predict.set_defaults(func=cmd_predict)
 
     # --- infer ---
@@ -141,6 +245,7 @@ def main() -> None:
     p_infer.add_argument("--config", required=True, help="Path to resolved config YAML.")
     p_infer.add_argument("--data", required=True, help="Path to inference dataset (CSV/Parquet).")
     p_infer.add_argument("--output-subdir", required=True, help="Subdirectory name for inference outputs.")
+    p_infer.add_argument("--force-restart", action="store_true", help="Delete this stage's checkpoint and restart from scratch")
     p_infer.set_defaults(func=cmd_infer)
 
     # --- plot ---

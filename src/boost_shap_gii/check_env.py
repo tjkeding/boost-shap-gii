@@ -12,7 +12,7 @@ PYTHON_DEPS = [
 
 R_DEPS = [
     "ggplot2", "dplyr", "nanoparquet", "tidyr", "foreach", "doParallel",
-    "gridExtra", "stringr", "yaml"
+    "gridExtra", "stringr", "yaml", "ggtext"
 ]
 
 def check_python():

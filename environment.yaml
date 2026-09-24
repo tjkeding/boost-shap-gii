@@ -35,10 +35,10 @@ dependencies:
 # ============================================================================
 # Required R packages for plot.R:
 #   ggplot2, dplyr, nanoparquet, tidyr, foreach, doParallel,
-#   gridExtra, splines, stringr, yaml
+#   gridExtra, splines, stringr, yaml, ggtext
 #
 # Install in R:
 #   install.packages(c("ggplot2", "dplyr", "nanoparquet", "tidyr", "foreach",
-#                      "doParallel", "gridExtra", "stringr", "yaml"))
+#                      "doParallel", "gridExtra", "stringr", "yaml", "ggtext"))
 #   # Note: splines, grid, grDevices ship with base R
 # ============================================================================

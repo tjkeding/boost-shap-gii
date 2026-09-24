@@ -482,7 +482,176 @@ LLM tool use carries no claim to scientific credit under project policy. All sco
 
 ---
 
+### Session 2026-09-17/18/21 -- Visualization feature: dual-source microdata, per-stratum V splines, bootstrap ribbons
+
+**Session scope:**
+
+- New `plot.R` capability, unrelated to the pipeline's statistical computation modules: significance scope expanded from `sig_GII`-only to `sig_GII | sig_V` (two-tier ranking; V-only-significant effects use a dedicated `microdata_V.parquet` source when present and receive a `_Vsig` filename suffix, omitting the M-panel density since they did not pass the M significance test).
+- Interaction plots render **both moderator orientations** (each interacting feature plotted as the focal axis with the other as moderator), replacing the prior single-orientation rendering.
+- Bootstrap standard-deviation ribbons (continuous focal features) and error bars (discrete focal features) added to V-panel trend overlays, computed independently of the significance-testing bootstrap via a new `plot.bootstrap_ribbons.n_boot` config key (default 2000).
+- Crossing-line computation for interaction plots (`find_adjacent_crossovers`) removed as dead code after a user visual-critique cycle found it added no interpretive value.
+- New config surface: `plot.max_interaction_strata` (default 3, must be `>= 2`), capping the number of moderator strata shown per interaction plot; a discrete-singleton missing-plot crash found via `/run-local` against the applied study dataset, and a nominal-capacity-formula bug found in the same pass, were both fixed within this session.
+- Two rounds of user visual critique against real-data `/run-local` renders (not synthetic fixtures) drove iterative refinement: crossing-line removal, `max_interaction_strata` default reduction from 5 to 3, per-stratum connecting lines for discrete-focal interaction plots, and a bootstrap-performance-parquet backfill path for runs predating the artifact.
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for brainstorm sessions, implementation plan structuring, critique-consumption brainstorm sessions.
+- Claude Sonnet 4.6 / Claude Sonnet 5 (Anthropic): used for code scaffolding under direction, test design and execution, `/run-local` visual verification against the applied study dataset (de-identified, non-PII).
+
+LLM tool use carries no claim to scientific credit under project policy. All visual-design decisions were made by the researcher via direct inspection of rendered plots against real data; no rendering was accepted without explicit researcher visual confirmation.
+
+**Key decisions (researcher-approved):**
+
+- *Two-tier significance scope*: `sig_GII OR sig_V` (not `sig_GII` alone) determines which effects are plotted, since an effect can have a real dose-response signal (V) without clearing the combined GII threshold; V-only effects are ranked separately and flagged in their own file-naming scheme so they are not mistaken for GII-significant effects.
+- *Both moderator orientations*: the researcher determined that showing only one orientation per interaction discarded a scientifically meaningful view (each feature's own dose-response conditioned on the other), so both orientations are rendered as separate files.
+- *Independent bootstrap-ribbon budget*: the researcher approved a `plot.*`-scoped bootstrap count distinct from `shap.bootstrapping.n_boot`, since the visualization ribbon serves a different purpose (visual uncertainty band) than the significance-testing bootstrap and need not share its iteration count.
+- *max_interaction_strata default reduction (5 to 3)*: the researcher determined that 5 simultaneous strata produced visually cluttered interaction plots at the panel's fixed width; 3 was approved after direct visual comparison.
+
+**Test metrics:**
+
+- Pre-session (v1.6.0 baseline): 914 tests across 28 test files (914 passing, 0 failing).
+- Post-session: 968 tests (968 passing, 0 failing), including Meyer (1992) postcondition-strengthening re-expressions for all obsolete-test dispositions arising from the crossing-line removal and orientation-rendering changes.
+
+**Audit trail references (.aid/reports/):**
+
+- Session reports for this cycle predate the working-directory report retention window for this document pass; the cumulative code state is captured directly in `plot.R` and verified via the `/run-local` reports referenced in the Session 2026-09-22 and 2026-09-23 entries below, which re-verify this session's rendering as part of their own visual regression checks.
+
+---
+
+### Session 2026-09-22 -- Visualization critique cycles 1-2: stat-label positioning, legend placement, interaction visual tuning
+
+**Session scope:**
+
+- **Critique cycle 1** (6 topics against the Session 2026-09-17/18/21 baseline): model performance panel distributions renamed "Permutation Null" / "Trained"; M-panel stat labels repositioned below distributions via a `nudge_stat_labels()` collision-avoidance helper (later removed, see Session 2026-09-23); singleton V-panel x-axis label uses the actual feature name instead of a generic label; interaction legend switched to ascending natural order; interaction-plot visual tuning (dot alpha, mean-box width/linewidth, connecting-line width/alpha, bootstrap SD error-bar width/alpha).
+- **Critique cycle 2** (3 topics, refining cycle 1's values after user inspection found above-axis labels occluded by `geom_vline` mean lines): performance-panel and M-panel stat labels moved from above-axis to below-axis positioning with a compact single-line `"%.2f (%.2f)"` format; M-panel legend given data-driven adaptive left/right placement based on the two distributions' mass-center midpoint (superseded in Session 2026-09-23, see below); further interaction visual tuning.
+- **Critique cycle 3** (3 topics) was locked via brainstorm in this session but its implementation, test, and `/run-local` re-verification were carried into Session 2026-09-23.
+- Both implemented cycles were verified against the applied study dataset via `/run-local` (1290 PNGs regenerated per pass, 0 R errors).
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for brainstorm sessions (critique consumption and cycle-3 locking), implementation plan structuring.
+- Claude Sonnet 4.6 / Claude Sonnet 5 (Anthropic): used for code scaffolding under direction, test design and execution (including new behavioral tests extracting and exercising the adaptive-legend placement logic via `Rscript`), `/run-local` visual verification.
+
+LLM tool use carries no claim to scientific credit under project policy. Every positioning and formatting value in this session was set, inspected, and either approved or rejected by the researcher via direct visual comparison of rendered PNGs; no heuristic was accepted on the basis of code review alone.
+
+**Key decisions (researcher-approved):**
+
+- *Below-axis stat-label positioning (cycle 2)*: the researcher rejected the cycle-1 above-axis position after finding it visually occluded by the density mean lines, and approved a below-axis position with a more compact label format.
+- *Adaptive M-panel legend placement (cycle 2)*: the researcher approved a data-driven left/right inset heuristic over a fixed position, though this was later found insufficient and replaced in Session 2026-09-23 (see that entry's key decisions).
+- *Cycle-3 scope lock without same-session implementation*: the researcher explicitly deferred implementation of the third critique cycle to the next session rather than extending this session, keeping the single-pass discipline between locking a design decision and implementing it.
+
+**Test metrics:**
+
+- Pre-session (v1.7.0-pending baseline): 968 tests across 30 test files (968 passing, 0 failing).
+- Post-cycle-1: 978 tests (978 passing, 0 failing); 7 obsolete-test re-expressions, 0 product bugs.
+- Post-cycle-2: 985 tests (985 passing, 0 failing); 7 obsolete-test re-expressions (including one full contract inversion for the legend-placement logic) plus 7 new behavioral tests in `tests/test_build_20260922b.py`, 0 product bugs.
+
+**Audit trail references (.aid/reports/):**
+
+- Brainstorm: `boost-shap-gii_brainstorm_20260922_120000.md`, `boost-shap-gii_brainstorm_20260922_160000.md`, `boost-shap-gii_brainstorm_20260922_184900.md`
+- Implementation plans: `boost-shap-gii_implement_plan_20260922_130000.md`, `boost-shap-gii_implement_plan_20260922_161500.md`
+- Implementation builds: `boost-shap-gii_implement_build_20260922_140000.md`, `boost-shap-gii_implement_build_20260922_162500.md`
+- Test reports: `boost-shap-gii_test_20260922_143500.md`, `boost-shap-gii_test_20260922_183200.md`
+- Run-local reports: `boost-shap-gii_run-local_20260922_134936.md`, `boost-shap-gii_run-local_20260922_143521.md`
+
+---
+
+### Session 2026-09-23 -- Visualization critique cycle 3 and stat-label strategy redesign; ggtext dependency fix
+
+**Session scope:**
+
+- **Critique cycle 3 implementation** (locked in the prior session's brainstorm): iterative attempts to resolve residual stat-label positioning problems on the model performance panel and M-panel spanned multiple sub-cycles within this session: performance-panel layout changed from a 2-column quadrant grid to a single-column vertical stack; stat-label vertical displacement (`vjust`) and margins were tuned upward and then found to push labels into the x-axis tick-label zone; facet ordering was corrected to a fixed RMSE/MAE/R² sequence with Unicode `R²` rendering; stat-label geoms were switched from transparent `geom_text` to opaque white-filled `geom_label` so labels occlude the mean lines beneath them rather than being occluded themselves; a factor-level consistency bug in the bootstrap-distribution data path (`df_boot_long$metric`) was fixed to prevent `bind_rows` from silently coercing a factor column to character.
+- **M-panel stat-label strategy redesign**: after eight iterative sub-cycles of spatial-annotation tuning (`vjust`, `label.padding`, `axis.text.x` margin, `plot.margin` combinations) failed to produce a configuration free of label-to-label collision when the noise and signal density distributions sit close together, the M-panel stat labels were redesigned entirely: `mean (SD)` values are now embedded directly into the legend's "Noise"/"Signal" entries via `ggtext::element_markdown()` (bold label text, smaller-font embedded statistic), eliminating spatial annotation, positioning, and white-background occlusion logic for this panel. The now-dead `nudge_stat_labels()` collision-avoidance helper (introduced in Session 2026-09-22) and both `annotate("label", ...)` call sites were removed.
+- **V-panel x-axis label overlap**: long discrete category names (e.g., multi-word event-type labels) were found to overlap horizontally on the V-panel x-axis. A 45-degree axis-label rotation was implemented, visually verified via `/run-local`, and then rejected by the researcher on inspection; the fix was reverted and replaced with underscore-to-newline label wrapping (`gsub("_", "\n", levels(fac))`, both singleton and interaction V-panels), which stacks multi-word category names onto separate lines without rotating the axis.
+- **`ggtext` dependency gap**: while preparing this session's documentation pass, an undeclared dependency was found: `ggtext::element_markdown()` (introduced by the M-panel legend redesign, above) was never added to `check_env.py`'s `R_DEPS` list or `environment.yaml`'s R-package install instructions, meaning a fresh environment following the documented install steps would pass `check-env` but crash at the M-panel legend render. The researcher granted the documentation pass a narrow, session-bound write exception to add `ggtext` to both files (normally out of scope for `/document`, which is restricted to comments and documentation), and `check-env` was re-run to confirm the fix.
+
+**LLM tools used:**
+
+- Claude Sonnet 5 (Anthropic): used for implementation plan structuring, code scaffolding under direction, test design and execution, `/run-local` visual verification, and this documentation pass.
+
+LLM tool use carries no claim to scientific credit under project policy. Every stat-label positioning and legend-formatting decision in this session was set, rendered, and either approved or rejected by the researcher via direct visual inspection of real-data plots; the M-panel legend redesign was the researcher's own proposed alternative after rejecting continued spatial-annotation tuning, and the V-panel rotation reversion was likewise a direct researcher rejection on visual inspection. The `ggtext` dependency-gap remediation scope (which two files, which write mechanism) was explicitly approved by the researcher before any edit was made outside `/document`'s default write scope.
+
+**Key decisions (researcher-approved):**
+
+- *Legend-integrated M-panel stats over spatial annotation*: after eight sub-cycles of tuning spatial `annotate("label", ...)` positioning failed to eliminate label-to-label collision under close distributions, the researcher approved abandoning spatial annotation for the M-panel entirely in favor of embedding statistics into the legend text.
+- *Newline-wrapped category labels over axis rotation*: the researcher rejected the 45-degree rotation after visual inspection (own stated reason: preference against rotated text) and approved underscore-to-newline wrapping as the alternative, which keeps labels horizontal.
+- *Session-bound, narrowly-scoped write exception for the ggtext fix*: the researcher approved a temporary grant limited to two specific files (`check_env.py`, `environment.yaml`) and the `write`/`Edit` operation only, rather than broadening `/document`'s write scope generally.
+
+**Test metrics:**
+
+- Pre-session (Session 2026-09-22 baseline): 985 tests across 30 test files (985 passing, 0 failing).
+- Mid-session (after critique cycle 3's performance-panel and stat-label sub-cycles, before the legend-integration redesign): 1004 tests across 31 test files (1004 passing, 0 failing); all pre-design failures within this session were dispositioned obsolete-test (each traceable to a specific, user-confirmed implementation reversion), 0 product bugs.
+- The M-panel legend-integration redesign, the V-panel newline-wrap fix, and the `ggtext` dependency addition were implemented after the last test run of this session and are **pending `/test` verification** before `/publish`.
+
+**Audit trail references (.aid/reports/):**
+
+- Implementation plans: `boost-shap-gii_implement_plan_20260923_101500.md`, `boost-shap-gii_implement_plan_20260923_120000.md`, `boost-shap-gii_implement_plan_20260923_130000.md`, `boost-shap-gii_implement_plan_20260923_174500.md`, `boost-shap-gii_implement_plan_20260923_190000.md`, `boost-shap-gii_implement_plan_20260923_203000.md`, `boost-shap-gii_implement_plan_20260923_213000.md`, `boost-shap-gii_implement_plan_20260923_220000.md`, `boost-shap-gii_implement_plan_20260923_230000.md`
+- Implementation builds: `boost-shap-gii_implement_build_20260923_121000.md`, `boost-shap-gii_implement_build_20260923_151500.md`, `boost-shap-gii_implement_build_20260923_165500.md`, `boost-shap-gii_implement_build_20260923_175000.md`, `boost-shap-gii_implement_build_20260923_190500.md`, `boost-shap-gii_implement_build_20260923_203500.md`, `boost-shap-gii_implement_build_20260923_213500.md`, `boost-shap-gii_implement_build_20260923_220500.md`, `boost-shap-gii_implement_build_20260923_230500.md`
+- Test reports: `boost-shap-gii_test_20260923_130900.md`, `boost-shap-gii_test_20260923_152800.md`, `boost-shap-gii_test_20260923_170500.md`, `boost-shap-gii_test_20260923_171500.md`, `boost-shap-gii_test_20260923_180200.md`, `boost-shap-gii_test_20260923_195500.md`, `boost-shap-gii_test_20260923_202800.md`
+- Run-local reports: `boost-shap-gii_run-local_20260923_091603.md`, `boost-shap-gii_run-local_20260923_115704.md`, `boost-shap-gii_run-local_20260923_172000.md`, `boost-shap-gii_run-local_20260923_183000.md`, `boost-shap-gii_run-local_20260923_200000.md`
+
+---
+
+### Session 2026-09-24 -- Checkpoint/resume infrastructure for crash-safe pipeline execution
+
+**Session scope:**
+
+- **Checkpoint/resume infrastructure**: added per-stage JSON checkpoint files (`_checkpoint_train.json`, `_checkpoint_predict.json`, `_checkpoint_infer.json`) enabling crash-safe resumption without recomputation of completed work. Train resumes at fold granularity (five-artifact completion predicate); predict and infer resume at phase granularity (P1 through P5). Config-hash validation (SHA-256 on stage-scoped config sections) invalidates stale checkpoints when user configuration changes. Predecessor-mtime guards provide automatic cascade invalidation across stages (predict watches train's checkpoint mtime; infer watches predict's).
+- **Bootstrap refit cache skip**: `indiv_reports.py`'s `orchestrate_bootstrap_cache` scans for existing `(b, k)` refit files before dispatch, skipping completed pairs and reconstructing alpha values from per-refit sidecar files (`fold_{k}_alpha.json`).
+- **`--force-restart` CLI flag**: added to `train`, `predict`, and `infer` subcommands via `cli.py`. Deletes the current stage's checkpoint and restarts; does not cascade (downstream invalidation via mtime guard).
+- **Data-path normalization fix**: `infer.py`'s checkpoint data-path guard now compares absolute paths (`os.path.abspath`) rather than raw strings, preventing spurious invalidation when the same file is referenced via different relative paths.
+
+**LLM tools used:**
+
+- Claude Opus 4.6 (Anthropic): used for brainstorm session (checkpoint/resume design decisions), critical review of the brainstorm's plan, and implementation plan structuring.
+- Claude Sonnet 5 (Anthropic): used for implementation build execution, test design and execution, and this documentation pass.
+
+LLM tool use carries no claim to scientific credit under project policy. All design decisions (config-hash scoping, predecessor-mtime cascade vs. explicit inter-stage signaling, five-artifact fold-completion predicate, phase-gate decomposition, bootstrap cache skip with alpha sidecar reconstruction) were proposed and locked by the researcher during the brainstorm phase. The checkpoint/resume architecture was reviewed independently before implementation began.
+
+**Key decisions (researcher-approved):**
+
+- *Stage-scoped config hashing with superset cascading*: train scope = {execution, paths, features, modeling, aggregate_shap, transformations}; predict/infer scope = train scope plus {shap}. Hash computed from the raw user config pre-defaults, so auto-filled defaults do not trigger invalidation.
+- *Predecessor-mtime guard over explicit inter-stage signaling*: simpler to implement and reason about; avoids introducing a message-passing mechanism between stages that would need its own error handling.
+- *Five-artifact fold-completion predicate*: a fold is complete if and only if all five artifacts exist (model, shadow model, OOF CSV, metrics JSON, params JSON). Partial writes (e.g., crash after model save but before metrics save) are re-run.
+- *P4 pass-through in infer.py*: infer's "P4" consumes predict's bootstrap cache rather than building it; it has no terminal artifact or checkpoint entry, only a prerequisite existence check.
+- *fold_transform_metadata truncation on resume*: when train resumes after a crash that partially wrote fold_transform_metadata.json, the file is truncated to the number of completed folds, discarding orphaned entries from the incomplete fold.
+- *Data-path normalization*: routed from test design (discovered as a gap during test design; test was written encoding the corrected contract ahead of the fix).
+
+**Test metrics:**
+
+- Pre-session (Session 2026-09-23 baseline): 1005 tests (1005 passing, 0 failing).
+- Post-session: 1068 tests (1068 passing, 0 failing); 63 new tests in `tests/test_checkpoint_resume.py` covering the full checkpoint/resume feature set; 0 product bugs.
+
+**Audit trail references (.aid/reports/):**
+
+- Brainstorm: `boost-shap-gii_brainstorm_20260924_140000.md`
+- Critical review: `boost-shap-gii_cr_20260924_150000.md`
+- Implementation plans: `boost-shap-gii_implement_plan_20260924_160000.md`, `boost-shap-gii_implement_plan_20260924_191500.md`
+- Implementation builds: `boost-shap-gii_implement_build_20260924_170000.md`, `boost-shap-gii_implement_build_20260924_191500.md`
+- Test reports: `boost-shap-gii_test_20260924_181500.md`, `boost-shap-gii_test_20260924_192500.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Version 1.7.0 -- 2026-09-24 (Visualization overhaul, checkpoint/resume infrastructure)
+
+Feature release spanning Sessions 2026-09-17 through 2026-09-24. Adds a comprehensive visualization feature set and crash-safe pipeline resumption.
+
+- **Dual-source microdata dispatch**: significance scope expanded from `sig_GII`-only to `sig_GII | sig_V` (two-tier ranking). V-only-significant effects use a dedicated `microdata_V.parquet` source with a `_Vsig` filename suffix.
+- **Both moderator orientations for interaction plots**: each interacting feature is plotted as the focal axis with the other as moderator, producing two files per interaction pair.
+- **Per-stratum V splines and bootstrap SD ribbons**: continuous interaction V-panel overlays now render per-stratum splines with bootstrap standard-deviation ribbons (`plot.bootstrap_ribbons.n_boot`, default 2000). Discrete focal features show bootstrap SD error bars.
+- **Stat-label and legend redesign**: model performance panel distributions renamed "Permutation Null" / "Trained"; stat labels positioned below distributions with a compact `"mean (SD)"` format; M-panel statistics embedded directly in the legend via `ggtext::element_markdown()`, eliminating spatial-annotation collision problems; interaction legends use ascending natural order.
+- **V-panel label wrapping**: multi-word discrete category names are wrapped at underscores onto separate lines, keeping axis labels horizontal.
+- **Interaction visual tuning**: `max_interaction_strata` default reduced from 5 to 3; all crossing-line computation removed as dead code; dot alpha, mean-box, connecting-line, and error-bar styling refined across three user visual-critique cycles.
+- **Checkpoint/resume infrastructure**: per-stage JSON checkpoint files (`_checkpoint_train.json`, `_checkpoint_predict.json`, `_checkpoint_infer.json`) enable crash-safe resumption. Train resumes at fold granularity (five-artifact completion predicate); predict and infer resume at phase granularity. Config-hash validation (SHA-256 on stage-scoped config sections) invalidates stale checkpoints. Predecessor-mtime guards cascade invalidation across stages.
+- **Bootstrap refit cache skip**: `indiv_reports.py` scans for existing refit files before dispatch, skipping completed `(b, k)` pairs and reconstructing alpha values from per-refit sidecar files.
+- **`--force-restart` CLI flag**: added to `train`, `predict`, and `infer` subcommands; deletes the current stage's checkpoint without cascade.
+- **`ggtext` dependency**: declared in `check_env.py` and `environment.yaml`.
+- **Documentation**: README.md and INPUT_SPECIFICATION.md updated with checkpoint/resume infrastructure documentation and CLI flag reference.
+- **Tests**: post-session total 1068 tests (1068 passing, 0 failing).
+
+---
 
 ### Version 1.6.0 -- 2026-08-26 (per-fold SHAP scaling P0 fix)
 

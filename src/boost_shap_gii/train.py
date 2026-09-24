@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import warnings
@@ -24,10 +25,15 @@ from catboost import CatBoostClassifier, CatBoostRegressor, Pool
 import optuna
 from optuna.samplers import TPESampler
 
+from . import __version__
 from .utils import (
     _block_permute_shadow,
+    compute_config_hash,
+    load_checkpoint,
     load_config,
     load_dataframe,
+    save_checkpoint,
+    save_csv_atomic,
     save_json_atomic,
     detect_task,
     is_classification,
@@ -625,15 +631,48 @@ def run_optuna_tuning(
 # 3. Main Training Pipeline
 # -----------------------------------------------------------------------------
 
+def _fold_complete(run_dir, fold_idx):
+    """Return True if all five per-fold artifacts exist for fold_idx."""
+    artifacts = [
+        f"model_fold_{fold_idx}.cbm",
+        f"shadow_model_fold_{fold_idx}.cbm",
+        f"_oof_fold_{fold_idx}.csv",
+        f"_metrics_fold_{fold_idx}.json",
+        f"_params_fold_{fold_idx}.json",
+    ]
+    return all(os.path.exists(os.path.join(run_dir, a)) for a in artifacts)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Clean Train Pipeline")
     parser.add_argument("--config", required=True, help="Path to YAML config")
+    parser.add_argument("--force-restart", action="store_true")
     args = parser.parse_args()
 
     # 1. Setup
     config = load_config(args.config)
+    config_hash = compute_config_hash(config, "train")
     run_dir = config["paths"]["output_dir"]
     os.makedirs(run_dir, exist_ok=True)
+
+    checkpoint_path = os.path.join(run_dir, "_checkpoint_train.json")
+    force_restart = getattr(args, "force_restart", False)
+
+    if force_restart and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print("[RESTART] Forced restart; checkpoint removed.")
+
+    existing_checkpoint = load_checkpoint(checkpoint_path)
+    if existing_checkpoint is not None:
+        if existing_checkpoint["config_hash"] != config_hash:
+            os.remove(checkpoint_path)
+            existing_checkpoint = None
+            print("[RESTART] Config changed; checkpoint invalidated.")
+        elif existing_checkpoint["status"] == "complete":
+            print("[RESUME] Training already complete; nothing to do.")
+            return
+        else:
+            print("[RESUME] Partial checkpoint found; will resume after setup.")
 
     # 2. Load Data
     data_path = config["paths"]["input_data"]
@@ -763,14 +802,14 @@ def main():
         else:
             _diagnose_outcome_distribution(y, outcome_cols[0])
 
-    # Load and validate transformations module (Site 2)
+    # Load and validate transformations module
     transform_module = load_transform_module(config)
     if transform_module is not None:
         tx_cfg = config["transformations"]
         validate_transform_config(tx_cfg.get("required_cols", []), df_raw, "train")
         print(f"[INFO] Transformations module loaded: {tx_cfg['file']}")
 
-    # Upfront smoke test (Site 3)
+    # Upfront smoke test
     if transform_module is not None:
         seed = config["execution"]["random_seed"]
         n_smoke = min(20, len(df_raw))
@@ -1008,9 +1047,56 @@ def main():
     fold_assignments = np.full(len(X), -1, dtype=int)
     all_fold_transform_meta = []
 
+    completed_folds = set()
+    if existing_checkpoint is not None and existing_checkpoint["status"] == "partial":
+        n_folds_total = splitter.get_n_splits()
+        for k in range(n_folds_total):
+            if _fold_complete(run_dir, k):
+                completed_folds.add(k)
+
+        if completed_folds:
+            for k in sorted(completed_folds):
+                fold_df = pd.read_csv(os.path.join(run_dir, f"_oof_fold_{k}.csv"))
+                row_idx = fold_df["row_idx"].values
+                pred_cols = [c for c in fold_df.columns if c != "row_idx"]
+                if task == "multiclass_classification":
+                    oof_preds.iloc[row_idx] = fold_df[pred_cols].values
+                elif task == "multi_regression":
+                    oof_preds.iloc[row_idx] = fold_df[pred_cols].values
+                else:
+                    oof_preds.iloc[row_idx] = fold_df["y_pred"].values
+                fold_assignments[row_idx] = k
+
+                with open(os.path.join(run_dir, f"_metrics_fold_{k}.json")) as f:
+                    fold_metrics.append(json.load(f))
+
+            if transform_module is not None:
+                ftm_path = os.path.join(run_dir, "fold_transform_metadata.json")
+                if os.path.exists(ftm_path):
+                    with open(ftm_path) as f:
+                        all_fold_transform_meta = json.load(f)[:len(completed_folds)]
+
+            print(f"[RESUME] Reconstructed {len(completed_folds)}/{n_folds_total} folds; resuming.")
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if existing_checkpoint is None:
+        existing_checkpoint = {
+            "pipeline_version": __version__,
+            "config_hash": config_hash,
+            "stage": "train",
+            "status": "partial",
+            "started_at": now_utc,
+            "updated_at": now_utc,
+            "predecessor_checkpoint_mtime": None,
+            "progress": {"completed_folds": sorted(completed_folds), "total_folds": splitter.get_n_splits()}
+        }
+        save_checkpoint(existing_checkpoint, checkpoint_path)
+
     print(f"[INFO] Starting {splitter.get_n_splits()}-Fold Nested CV...")
 
     for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(X, y_for_split)):
+        if fold_idx in completed_folds:
+            continue
         print(f"\n--- Fold {fold_idx + 1} ---")
 
         X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -1202,7 +1288,37 @@ def main():
         shadow_model_path = os.path.join(run_dir, f"shadow_model_fold_{fold_idx}.cbm")
         model_shadow.save_model(shadow_model_path)
 
-    # 6. Finalize
+        # 6. Per-fold checkpoint artifacts
+        # _oof_fold_{fold_idx}.csv
+        if task == "multiclass_classification":
+            fold_oof_data = {"row_idx": val_idx}
+            for col in oof_preds.columns:
+                fold_oof_data[col] = oof_preds.iloc[val_idx][col].values
+            fold_oof_df = pd.DataFrame(fold_oof_data)
+        elif task == "multi_regression":
+            fold_oof_data = {"row_idx": val_idx}
+            for col in outcome_cols:
+                fold_oof_data[f"y_pred_{col}"] = oof_preds[col].iloc[val_idx].values
+            fold_oof_df = pd.DataFrame(fold_oof_data)
+        else:
+            fold_oof_df = pd.DataFrame({"row_idx": val_idx, "y_pred": oof_preds.iloc[val_idx].values})
+        save_csv_atomic(fold_oof_df, os.path.join(run_dir, f"_oof_fold_{fold_idx}.csv"), index=False)
+
+        # _metrics_fold_{fold_idx}.json
+        save_json_atomic(metrics, os.path.join(run_dir, f"_metrics_fold_{fold_idx}.json"))
+
+        # _params_fold_{fold_idx}.json
+        save_json_atomic(
+            {"best_params": best_params, "tuned_iters": tuned_iters},
+            os.path.join(run_dir, f"_params_fold_{fold_idx}.json"),
+        )
+
+        # Update checkpoint progress
+        existing_checkpoint["progress"]["completed_folds"].append(fold_idx)
+        existing_checkpoint["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        save_checkpoint(existing_checkpoint, checkpoint_path)
+
+    # 7. Finalize
     print("\n[INFO] CV Complete. Saving Global Artifacts...")
     save_json_atomic(fold_assignments.tolist(), os.path.join(run_dir, "fold_assignments.json"))
 
@@ -1261,6 +1377,10 @@ def main():
 
     # --- Training-outcome statistics artifact (consumed by indiv_reports at predict / infer time) ---
     _write_train_outcome_stats(y_raw, task, outcome_cols, run_dir)
+
+    existing_checkpoint["status"] = "complete"
+    existing_checkpoint["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    save_checkpoint(existing_checkpoint, checkpoint_path)
 
     print(f"[SUCCESS] Training finished. Artifacts in: {run_dir}")
 

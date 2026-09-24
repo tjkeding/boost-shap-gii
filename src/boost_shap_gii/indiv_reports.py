@@ -344,8 +344,12 @@ def _fit_and_save_refit(
                 f"non-constant slope across samples. "
                 f"Range: [{alpha_vec.min():.8f}, {alpha_vec.max():.8f}]."
             )
-        return float(alpha_vec[0])
-    return 1.0
+        alpha = float(alpha_vec[0])
+    else:
+        alpha = 1.0
+    alpha_sidecar_path = os.path.join(os.path.dirname(out_path), f"fold_{k}_alpha.json")
+    save_json_atomic({"alpha": alpha}, alpha_sidecar_path)
+    return alpha
 
 
 # ---------------------------------------------------------------------------
@@ -627,10 +631,24 @@ def orchestrate_bootstrap_cache(
     # 4. Dispatch K * B refits to process pool
     max_workers = max(1, int(n_jobs))
 
+    completed_pairs = set()
+    for b in range(B):
+        iter_dir = os.path.join(cache_dir, f"iter_{b:05d}")
+        for k in range(K):
+            cbm_path = os.path.join(iter_dir, f"fold_{k}.cbm")
+            if os.path.exists(cbm_path):
+                completed_pairs.add((b, k))
+
+    if completed_pairs:
+        print(f"[RESUME] Bootstrap cache: {len(completed_pairs)}/{B * K} refits found; "
+              f"{B * K - len(completed_pairs)} remaining.")
+
     def _make_tasks():
         for b in range(B):
             s = shared_indices_list[b]
             for k in range(K):
+                if (b, k) in completed_pairs:
+                    continue
                 out_path = os.path.join(cache_dir, f"iter_{b:05d}", f"fold_{k}.cbm")
                 yield (b, k, s, params[k], x_tmp, y_tmp, nom_feats, task, out_path,
                        df_raw_tmp, transform_module_path, tx_params, outcome_col,
@@ -663,6 +681,14 @@ def orchestrate_bootstrap_cache(
                 print(f"[INFO] Bootstrap refits: {completed}/{total} complete.")
 
     print(f"[INFO] All {total} bootstrap refits complete.")
+
+    for (b, k) in completed_pairs:
+        sidecar = os.path.join(cache_dir, f"iter_{b:05d}", f"fold_{k}_alpha.json")
+        if os.path.exists(sidecar):
+            with open(sidecar) as f:
+                boot_alphas[b, k] = json.load(f)["alpha"]
+        else:
+            boot_alphas[b, k] = 1.0
 
     if back_transform_shap and is_affine:
         alphas_path = os.path.join(cache_dir, "bootstrap_alphas.npy")

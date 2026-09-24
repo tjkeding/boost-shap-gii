@@ -72,6 +72,11 @@ boost-shap-gii infer --config resolved_config.yaml --data new_data.csv --output-
 boost-shap-gii plot --config config.yaml
 ```
 
+**Resuming an interrupted run:** All three compute stages (`train`, `predict`, `infer`) write JSON checkpoint files that track progress. If a run is interrupted, re-invoking the same command resumes from the last completed step rather than restarting from scratch. To force a full restart, pass `--force-restart`:
+```bash
+boost-shap-gii train --config config.yaml --force-restart
+```
+
 **Per-individual SHAP reports (optional, configuration-driven):** Set `shap.indiv_ci_nboot > 0` in the config to enable per-individual SHAP bootstrap CIs during `predict` and `infer`. Reports are written to `indiv_reports/` within the output directory.
 
 #### Alternative: Shell Script
@@ -248,6 +253,38 @@ When `back_transform_shap: true`, the pipeline additionally verifies that the tr
 - `infer.py` applies `output_transform` using per-fold metadata persisted by `train.py` (`fold_transform_metadata.json`); it does not require access to the original training data file.
 
 See `INPUT_SPECIFICATION.md` for the full transform API contract, the smoke test specification, and the `transform_config.json` / `fold_transform_metadata.json` artifact schemas.
+
+---
+
+## Visualization (`plot.R`)
+
+Running `boost-shap-gii plot --config config.yaml --run-dir run_dir` produces three categories of PNG output under `<run_dir>/<shap_dir>/plots/`.
+
+### Model Performance Panel (`0_model_performance.png`)
+
+One density subplot per reported metric (e.g., RMSE, MAE, R²), each contrasting the model's permutation-null distribution against its actual performance. When `bootstrap_distributions_perf.parquet` is available (produced by `predict.py`, or backfilled automatically by `plot` from `predictions_oof.csv` for older runs), both distributions render as densities under a shared "Permutation Null" / "Trained" legend, with `mean (SD)` labels beneath each distribution's mean line. When bootstrap draws are unavailable, the panel falls back to a CI-band rectangle around the observed score instead of a second density.
+
+### GII Plots (`{rank}_{feature}_GII.png` / `_Vsig.png`)
+
+Each significant effect (features passing `sig_GII` or `sig_V` under the two-tier ranking; V-only effects use a `_Vsig` suffix and rank by `V` rather than `GII`) renders as a two-panel figure:
+
+- **M-panel** (density, main effects only — omitted for V-only effects): overlapping noise/signal SHAP-magnitude densities. The legend embeds each distribution's `mean (SD)` directly into its "Noise"/"Signal" entry (bold label, smaller-font stat), avoiding the panel-boundary label-collision problems that spatial annotations produce when the two distributions sit close together.
+- **V-panel** (scatter/trend): SHAP value vs. feature value. Continuous focal features render a per-observation scatter with an adaptive-knot spline trend and a bootstrap standard-deviation ribbon; discrete focal features (nominal/ordinal/binary, or low-cardinality continuous) render jittered points with per-level group means and bootstrap SD error bars. Long category names (after underscore-to-newline conversion) wrap onto multiple lines rather than overlapping horizontally.
+
+Interaction effects additionally render **both moderator orientations** (`_mod_<partner>.png` suffix on each), coloring points by the moderator's stratum. Moderator strata are capped at `plot.max_interaction_strata` (default 3): nominal moderators keep the top-contributing levels by V-contribution rank, ordinal/continuous moderators fall back to quantile binning when their natural level count exceeds the cap.
+
+### Per-Individual Reports (`indiv_reports/plots/`)
+
+See `INPUT_SPECIFICATION.md` Section 10 for the algorithmic description of per-individual dot-plus-whisker plots.
+
+### Configuration
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `plot.bootstrap_ribbons.n_boot` | integer | No (default `2000`) | Bootstrap resamples used to compute the V-panel's spline/group-mean standard-deviation ribbons and error bars. |
+| `plot.max_interaction_strata` | integer | No (default `3`, must be ≥ 2) | Maximum number of moderator strata shown per interaction plot. |
+
+See `INPUT_SPECIFICATION.md` Section 2 (`plot`) for the full set of required `plot.*` keys (`outcome_max`, `negate_shap`, `gii_y_label`, `gii_y_sublabel`, `indiv_y_label`, `indiv_y_sublabel`).
 
 ---
 

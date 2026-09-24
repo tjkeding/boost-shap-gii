@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -27,6 +28,49 @@ VALID_TASK_TYPES = {
     "multiclass_classification",
     "multi_regression",
 }
+
+# Config sections included in the hash for each pipeline stage.
+CONFIG_HASH_SCOPES = {
+    "train": ["execution", "paths", "features", "modeling", "aggregate_shap", "transformations"],
+    "predict": ["execution", "paths", "features", "modeling", "aggregate_shap", "transformations", "shap"],
+    "infer": ["execution", "paths", "features", "modeling", "aggregate_shap", "transformations", "shap"],
+}
+
+
+def compute_config_hash(config: Dict[str, Any], stage: str) -> str:
+    """Return a SHA-256 hex digest of the config sections relevant to *stage*."""
+    sections = CONFIG_HASH_SCOPES[stage]
+    filtered = {s: config.get(s, {}) for s in sections}
+    canonical = json.dumps(filtered, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def save_csv_atomic(df: "pd.DataFrame", path: str, **kwargs):
+    """Save a DataFrame to CSV atomically to prevent partial-write corruption."""
+    tmp_path = path + ".tmp"
+    df.to_csv(tmp_path, **kwargs)
+    os.replace(tmp_path, path)
+
+
+def load_checkpoint(path: str):
+    """Load a JSON checkpoint file; returns None if the file does not exist."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def save_checkpoint(data: Any, path: str):
+    """Persist *data* as a JSON checkpoint via atomic write."""
+    save_json_atomic(data, path)
+
+
+def get_predecessor_mtime(path: str):
+    """Return the mtime of *path*, or None if the file is absent or unreadable."""
+    try:
+        return os.path.getmtime(path)
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def _normalize_quotes(s):
@@ -1062,7 +1106,8 @@ def compute_permutation_test(y_true, y_pred, metric_fns, metric_names, n_perm, s
     return res_df
 
 
-def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
+def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05,
+                         return_distribution=False):
     """Compute a bootstrapped confidence interval for a metric (raw scale).
 
     Bootstrap iterations where all resampled y_true values share a single class are
@@ -1087,6 +1132,8 @@ def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
         Number of bootstrap iterations.
     alpha : float
         Significance level; CI = [alpha/2, 1-alpha/2] percentiles.
+    return_distribution : bool
+        If True, return the full array of bootstrap scores as a fourth element.
 
     Returns
     -------
@@ -1096,6 +1143,8 @@ def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
         Lower CI bound (alpha/2 percentile).
     upper : float
         Upper CI bound (1 - alpha/2 percentile).
+    boot_scores : np.ndarray (only when return_distribution=True)
+        Full array of valid bootstrap scores.
     """
     scores = []
     indices = np.arange(len(y_true))
@@ -1105,6 +1154,8 @@ def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
     try:
         base_score = metric_fn(y_true, y_pred)
     except Exception:
+        if return_distribution:
+            return np.nan, np.nan, np.nan, np.array([])
         return np.nan, np.nan, np.nan
 
     for _ in range(n_boot):
@@ -1135,10 +1186,14 @@ def compute_bootstrap_ci(y_true, y_pred, metric_fn, n_boot=2000, alpha=0.05):
             f"imbalance for this effect; CI is undefined.",
             RuntimeWarning,
         )
+        if return_distribution:
+            return base_score, float("nan"), float("nan"), np.array([])
         return base_score, float("nan"), float("nan")
 
     lower = np.percentile(scores, 100 * (alpha / 2))
     upper = np.percentile(scores, 100 * (1 - alpha / 2))
+    if return_distribution:
+        return base_score, lower, upper, np.array(scores)
     return base_score, lower, upper
 
 

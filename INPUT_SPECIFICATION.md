@@ -34,9 +34,9 @@ pip install -e .                                               # editable (devel
 After installation, the `boost-shap-gii` command is available on `PATH`:
 ```
 boost-shap-gii check-env
-boost-shap-gii train    --config CONFIG
-boost-shap-gii predict  --config CONFIG
-boost-shap-gii infer    --config CONFIG --data DATA --output-subdir SUBDIR
+boost-shap-gii train    --config CONFIG [--force-restart]
+boost-shap-gii predict  --config CONFIG [--force-restart]
+boost-shap-gii infer    --config CONFIG --data DATA --output-subdir SUBDIR [--force-restart]
 boost-shap-gii plot     --config CONFIG [--run-dir DIR]
 ```
 
@@ -44,6 +44,16 @@ Note: the `plot` subcommand previously accepted positional arguments `--outcome-
 `--negate-shap`, and `--y-axis-label`. These arguments have been removed. All plot
 parameters are now read from the config file under the `plot.*` keys (see Section 2
 and Section 10).
+
+**Automatic performance-bootstrap backfill**: before dispatching to `plot.R`, the `plot`
+subcommand checks the target run directory for `bootstrap_distributions_perf.parquet`. If
+absent (runs produced before this artifact existed), it recomputes the per-metric bootstrap
+score arrays directly from `predictions_oof.csv` (task-type-aware: regression/multi-regression
+use `neg_rmse`/`neg_mae`/`r2`; classification uses `roc_auc`/`accuracy` or
+`balanced_accuracy`/`f1_weighted`) and writes the artifact before invoking `plot.R`. Backfill
+failure is non-fatal: a warning is emitted and `plot.R` proceeds with the CI-band fallback
+rendering for the performance panel (see Section 4, "Model performance panel dual-mode
+rendering").
 
 #### Module Invocation (Alternative)
 Each pipeline stage can also be invoked as a Python module:
@@ -142,7 +152,10 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
 - Validates that the number of saved model files matches the fold count derived from the artifact.
   Raises `AssertionError` with a clear message if counts diverge (protects against
   incomplete training runs).
-- Bootstrapped 95% CIs for OOF metrics; permutation test for model vs. chance.
+- Bootstrapped 95% CIs for OOF metrics; permutation test for model vs. chance. The full
+  per-metric bootstrap score arrays (not just the CI bounds) are persisted to
+  `bootstrap_distributions_perf.parquet`, consumed by `plot.R`'s model performance panel
+  to render the trained-model distribution alongside the permutation-null distribution.
 - Triggers `run_shap_pipeline()` in OOF mode.
 
 #### Stage 6: Inference (`infer.py`)
@@ -169,6 +182,33 @@ as a pipeline orchestrator that chains training, prediction, and plotting.
 #### Stage 7: SHAP Analysis (`shap_utils.py`)
 - Boruta-style exceedance test with stratified max shadow distributions.
 - See Section 4 for full statistical specification.
+
+#### Checkpoint/Resume Infrastructure
+
+All three compute stages (`train`, `predict`, `infer`) write per-stage JSON checkpoint files that enable crash-safe resumption without recomputation of completed work.
+
+**Checkpoint files:**
+| Stage | File | Location |
+|---|---|---|
+| `train` | `_checkpoint_train.json` | `output_dir/` |
+| `predict` | `_checkpoint_predict.json` | `output_dir/` |
+| `infer` | `_checkpoint_infer.json` | `output_dir/<output_subdir>/` (per inference run) |
+
+**Config hash validation**: on entry, each stage computes a SHA-256 hash of the config sections relevant to that stage (train scope: `execution`, `paths`, `features`, `modeling`, `aggregate_shap`, `transformations`; predict and infer scope: train scope plus `shap`). If the hash differs from the stored checkpoint, the checkpoint is invalidated and the stage restarts. Config hashing operates on the raw user config before `fill_config_defaults()`, ensuring that changes to user-specified values invalidate the checkpoint while changes to auto-filled defaults do not.
+
+**Predecessor mtime guard**: `predict` stores the mtime of `_checkpoint_train.json` at creation time; `infer` stores the mtime of `_checkpoint_predict.json`. On resume, if the predecessor checkpoint has been modified (indicating the upstream stage was re-run), the downstream checkpoint is invalidated and the stage restarts. This provides automatic cascade invalidation without requiring explicit inter-stage signaling.
+
+**`infer` data-path guard**: `infer` additionally stores `os.path.abspath(args.data)` in its checkpoint. If the absolute data path changes between runs (indicating a different inference dataset), the checkpoint is invalidated.
+
+**Train resume granularity**: `train` checkpoints at the fold level. On resume, it reconstructs OOF accumulators from per-fold artifact files (`_oof_fold_{k}.csv`, `_metrics_fold_{k}.json`, `_params_fold_{k}.json`) and continues the fold loop from the next incomplete fold. The five-artifact completion predicate (`model_fold_{k}.cbm`, `shadow_model_fold_{k}.cbm`, `_oof_fold_{k}.csv`, `_metrics_fold_{k}.json`, `_params_fold_{k}.json`) ensures that partially written folds (e.g., a crash after model save but before metrics save) are re-run rather than treated as complete.
+
+**Predict/infer resume granularity**: `predict` and `infer` checkpoint at the phase level (P1 through P5), where each phase corresponds to a distinct compute block (OOF/ensemble predictions, metrics, SHAP pipeline, bootstrap cache, individual reports). On resume, completed phases are skipped and their terminal artifacts are reloaded from disk.
+
+**Bootstrap refit cache skip**: `indiv_reports.py` scans for existing `iter_{b:05d}/fold_{k}.cbm` files before dispatching refit jobs, skipping completed `(b, k)` pairs. Alpha sidecar files (`fold_{k}_alpha.json`) written alongside each refit model enable reconstruction of per-refit scale factors without re-probing `output_transform`.
+
+**Forced restart**: the `--force-restart` flag deletes the current stage's own checkpoint file and restarts from scratch. It does not cascade to downstream stages; downstream invalidation is handled by the predecessor mtime guard on the next invocation of the downstream stage.
+
+**All checkpoint files are prefixed with `_` and are not intended for user consumption.** They are implementation artifacts managed by the pipeline.
 
 ---
 
@@ -348,7 +388,7 @@ Written by `train.py` alongside `transform_config.json` when transformations are
 
 #### `plot`
 
-All `plot.*` keys are consumed exclusively by the `plot` subcommand (`plot.R` via `boost-shap-gii plot`). They are not referenced by `train`, `predict`, or `infer`. All six keys below are required when the `plot` subcommand is invoked; missing keys cause a loud failure before any plot is generated.
+All `plot.*` keys are consumed exclusively by the `plot` subcommand (`plot.R` via `boost-shap-gii plot`). They are not referenced by `train`, `predict`, or `infer`. The first six keys below are required when the `plot` subcommand is invoked; missing keys cause a loud failure before any plot is generated. The remaining two keys are optional and default when absent.
 
 | Key | Type | Required | Description |
 |---|---|---|---|
@@ -358,6 +398,8 @@ All `plot.*` keys are consumed exclusively by the `plot` subcommand (`plot.R` vi
 | `gii_y_sublabel` | str | Yes | Y-axis subtitle rendered verbatim below `gii_y_label` on GII plots. Pass an empty string `""` to suppress. |
 | `indiv_y_label` | str | Yes | Y-axis label rendered verbatim on per-individual SHAP plots (`indiv_reports/plots/`). |
 | `indiv_y_sublabel` | str | Yes | Y-axis subtitle rendered verbatim below `indiv_y_label` on per-individual plots. Pass an empty string `""` to suppress. |
+| `bootstrap_ribbons.n_boot` | int | No (default `2000`) | Bootstrap resamples used by `plot.R` to compute standard-deviation ribbons (continuous focal features) and error bars (discrete focal features) on V-panel trend overlays. Independent of `shap.bootstrapping.n_boot`, which governs the M/V/GII significance-testing bootstrap. |
+| `max_interaction_strata` | int | No (default `3`; must be `>= 2`) | Maximum number of moderator strata rendered per interaction V-panel. See Section 4 "V-Component Method Selection" for the level-selection algorithm applied when a moderator's natural cardinality exceeds this cap. |
 
 No plot titles are emitted anywhere in the pipeline. Label strings are the sole axis-description mechanism.
 
@@ -573,6 +615,22 @@ breaks group structure.
   so retry is statistically valid (unlike bootstrap drops, which carry diagnostic meaning).
 - P-value: `(sum(null >= observed) + 1) / (n_perm_effective + 1)` with +1 correction.
 
+#### Visualization Pipeline Algorithm Details (`plot.R`)
+
+**Dual-source microdata dispatch and two-tier ranking**: `plot.R` filters `shap_stats_global.csv` to `sig_GII | sig_V` (both computed via `toupper(...) == "TRUE"` string coercion, since the CSV round-trip can serialize booleans as either R or Python string forms). Effects are tagged `v_only = sig_V & !sig_GII` and ranked in two tiers: tier 0 (GII-significant) effects sort by descending `GII`; tier 1 (V-only) effects sort by descending `V` and are appended after all tier-0 effects, receiving a `_Vsig` filename suffix in place of `_GII`. For each effect, the per-observation microdata source is `microdata_V.parquet` when the effect is `v_only` and present there, otherwise `microdata_GII.parquet` (the `microdata_V.parquet` file is optional; its absence silently falls back to the GII source for all effects). V-only effects omit the M-panel (density) entirely, since they did not pass the M significance test and there is no signal/noise M distribution to contrast.
+
+**Moderator stratum capping** (interaction plots only, `plot.max_interaction_strata`, default 3): `stratify_moderator()` first assigns natural strata (raw categorical levels for nominal/ordinal/binary moderators, or natural levels for low-cardinality continuous moderators; quantile bins otherwise). If the resulting stratum count exceeds the cap, a second reduction pass applies:
+- **Nominal moderators**: strata are ranked by their ANOVA-style between-group contribution to total SHAP variance, `contribution_k = n_k * (mean_SHAP_k - grand_mean_SHAP)^2` (identical ranking statistic to the nominal-focal top-5 selection below), and only the top `max_interaction_strata` levels are retained.
+- **Ordinal/continuous moderators**: strata are rebuilt as `max_interaction_strata` quantile bins over the valid moderator values (`stratify_moderator`'s `method` field is updated to `"quantile_bins_capped"`).
+
+**Nominal focal top-5 selection** (both singleton and interaction V-panels, uncapped by `max_interaction_strata`): when a nominal focal feature has more than 5 levels, only the top 5 by the same V-contribution statistic (`contribution_k = n_k * (mean_SHAP_k - grand_mean_SHAP)^2`) are plotted. This mirrors the per-level contribution to the V-statistic shown in the panel, so the displayed subset matches the drivers of the reported V value.
+
+**Bootstrap SD ribbons/error bars** (`plot.bootstrap_ribbons.n_boot`, default 2000; independent of `shap.bootstrapping.n_boot`): for continuous focal features, `bootstrap_spline_sd()` refits the adaptive-knot spline on each of `n_boot` resamples and reports the pointwise standard deviation as a ribbon (`geom_ribbon`) around the point-estimate trend line. For discrete focal features, `bootstrap_group_mean_sd()` resamples within each level and reports the SD of the resampled group mean as an error bar. Both helpers require a minimum of `MIN_BOOT_N = 10` observations per group/resample; groups below this floor are silently omitted from the ribbon/error-bar overlay (the point-estimate trend/mean is still shown).
+
+**Model performance panel dual-mode rendering**: when `bootstrap_distributions_perf.parquet` exists in the run directory (written by `predict.py`, or backfilled by the `plot` subcommand from `predictions_oof.csv` for pre-existing runs that predate this artifact), the panel renders both the permutation-null and the trained-model bootstrap distributions as densities sharing one "Permutation Null" / "Trained" legend, with `mean (SD)` labels positioned at each distribution's mean line. When the bootstrap-distributions artifact is absent, the panel falls back to rendering only the permutation-null density plus a CI-band rectangle (`ci_low`/`ci_high` from `performance_final.csv`) around the observed score, with no shared legend.
+
+**Discrete category label wrapping**: category-level x-axis labels (nominal/ordinal focal features on both singleton and interaction V-panels) replace underscores with newlines (`gsub("_", "\n", levels(fac))`), stacking multi-word category names onto separate lines rather than rendering them as a single wide horizontal string. This avoids label-to-label overlap for long category names without requiring axis-label rotation.
+
 ---
 
 ### 5. Directory Structure & Artifacts
@@ -622,9 +680,17 @@ output_dir/
 ├── performance_final.csv         # Bootstrapped OOF performance with 95% CIs
 ├── permutation_test_results.csv  # Permutation test p-values
 ├── permutation_null_distributions.parquet
+├── bootstrap_distributions_perf.parquet  # Per-metric bootstrap score arrays (predict.py);
+│                                          #   backfilled by `plot` from predictions_oof.csv
+│                                          #   when absent (pre-existing runs)
 ├── task_info.json                # {"task_type": "..."}
+├── _checkpoint_train.json        # Train checkpoint (internal; not for user consumption)
+├── _checkpoint_predict.json      # Predict checkpoint (internal; not for user consumption)
 ├── model_fold_<k>.cbm            # Clean CatBoost models (K folds)
 ├── shadow_model_fold_<k>.cbm     # Shadow CatBoost models (K folds)
+├── _oof_fold_<k>.csv             # Per-fold OOF predictions (checkpoint artifact; internal)
+├── _metrics_fold_<k>.json        # Per-fold metrics (checkpoint artifact; internal)
+├── _params_fold_<k>.json         # Per-fold tuned params (checkpoint artifact; internal)
 ├── shap_analysis/                # (or shap_<label>/ for multiclass/multi-regression)
 │   ├── shap_stats_global.csv          # Final GII results table
 │   ├── real_shap_interaction_matrix.parquet
@@ -640,13 +706,16 @@ output_dir/
 │   ├── microdata_GII.parquet
 │   └── plots/
 │       ├── 0_model_performance.png
-│       └── <rank>_<effect>_GII.png
+│       ├── <rank>_<effect>_GII.png          # or _Vsig.png for V-only significant effects
+│       └── <rank>_<effect>_GII_mod_<partner>.png  # interactions: one file per moderator
+│                                                    #   orientation (both directions)
 ├── bootstrap_refits/             # Per-individual CI cache (only when indiv_ci_nboot > 0)
 │   ├── bootstrap_metadata.json  # Design summary: K, B, random_seed, HP per fold
 │   ├── bootstrap_alphas.npy     # Per-refit alpha (B×K); only when back_transform_shap
 │   ├── shared_indices.npz       # Bootstrap sample index matrix, shape (B, N_train)
 │   ├── iter_00000/
 │   │   ├── fold_0.cbm           # Bootstrap-refitted CatBoost models (one per fold)
+│   │   ├── fold_0_alpha.json    # Alpha sidecar (only when back_transform_shap)
 │   │   └── fold_<K-1>.cbm
 │   └── iter_<B-1:05d>/
 │       └── ...
@@ -661,6 +730,7 @@ output_dir/
 
 # Inference subdirectory (infer.py):
 output_dir/<subdir>/
+├── _checkpoint_infer.json          # Infer checkpoint (internal; not for user consumption)
 ├── predictions_ensemble.csv
 ├── performance_final.csv
 ├── performance_per_model.csv

@@ -153,3 +153,8 @@ plot:
   indiv_y_label: "SHAP Value (scaled)"
 
   indiv_y_sublabel: "Per-individual contribution to predicted outcome"
+
+  bootstrap_ribbons:
+    n_boot: 2000           # Bootstrap resamples for uncertainty ribbons on V-component plots (default: 2000)
+
+  max_interaction_strata: 3  # Maximum moderator strata for interaction plots (default: 3)

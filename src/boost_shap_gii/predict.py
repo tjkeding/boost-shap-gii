@@ -8,6 +8,7 @@ import json
 import os
 import glob
 import warnings
+import datetime
 
 import numpy as np
 import pandas as pd
@@ -28,9 +29,14 @@ from .utils import (
     load_transform_module,
     resolve_transform_path,
     coerce_ordinal_column,
+    compute_config_hash,
+    load_checkpoint,
+    save_checkpoint,
+    get_predecessor_mtime,
 )
 
 from .shap_utils import run_shap_pipeline
+from . import __version__
 
 # Suppress noisy warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -44,13 +50,65 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 def main():
     parser = argparse.ArgumentParser(description="Clean Inference Driver")
     parser.add_argument("--config", required=True)
+    parser.add_argument("--force-restart", action="store_true")
     args = parser.parse_args()
 
     # 1. Setup
     config = load_config(args.config)
+    config_hash = compute_config_hash(config, "predict")
     run_dir = config["paths"]["output_dir"]
 
     print(f"[INFO] Inference Run Directory: {run_dir}")
+
+    checkpoint_path = os.path.join(run_dir, "_checkpoint_predict.json")
+    force_restart = getattr(args, "force_restart", False)
+    train_checkpoint_path = os.path.join(run_dir, "_checkpoint_train.json")
+
+    if force_restart and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print("[RESTART] Forced restart; checkpoint removed.")
+
+    existing_checkpoint = load_checkpoint(checkpoint_path)
+    completed_phases = set()
+
+    if existing_checkpoint is not None:
+        if existing_checkpoint["config_hash"] != config_hash:
+            os.remove(checkpoint_path)
+            existing_checkpoint = None
+            print("[RESTART] Config changed; checkpoint invalidated.")
+        else:
+            stored_mtime = existing_checkpoint.get("predecessor_checkpoint_mtime")
+            current_mtime = get_predecessor_mtime(train_checkpoint_path)
+            if stored_mtime != current_mtime:
+                os.remove(checkpoint_path)
+                existing_checkpoint = None
+                print("[RESTART] Train checkpoint changed; predict checkpoint invalidated.")
+            elif existing_checkpoint["status"] == "complete":
+                print("[RESUME] Predict already complete; nothing to do.")
+                return
+            else:
+                completed_phases = set(existing_checkpoint.get("progress", {}).get("completed_phases", []))
+                print(f"[RESUME] Partial checkpoint found; completed phases: {sorted(completed_phases)}.")
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if existing_checkpoint is None:
+        existing_checkpoint = {
+            "pipeline_version": __version__,
+            "config_hash": config_hash,
+            "stage": "predict",
+            "status": "partial",
+            "started_at": now_utc,
+            "updated_at": now_utc,
+            "predecessor_checkpoint_mtime": get_predecessor_mtime(train_checkpoint_path),
+            "progress": {"completed_phases": [], "skipped_phases": []}
+        }
+        save_checkpoint(existing_checkpoint, checkpoint_path)
+
+    def _update_predict_checkpoint(phase_id):
+        if phase_id not in existing_checkpoint["progress"]["completed_phases"]:
+            existing_checkpoint["progress"]["completed_phases"].append(phase_id)
+        existing_checkpoint["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        save_checkpoint(existing_checkpoint, checkpoint_path)
 
     # 2. Load Metadata (Strict Alignment with Train)
     try:
@@ -273,231 +331,278 @@ def main():
                     f"continuous, invertible outcome transformation."
                 )
 
-    for fold_idx in range(n_folds):
-        val_idx = np.where(fold_assignments == fold_idx)[0]
-        model_path = os.path.join(run_dir, f"model_fold_{fold_idx}.cbm")
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Missing model file for fold {fold_idx}: {model_path}")
+    if "P1" not in completed_phases:
+        for fold_idx in range(n_folds):
+            val_idx = np.where(fold_assignments == fold_idx)[0]
+            model_path = os.path.join(run_dir, f"model_fold_{fold_idx}.cbm")
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Missing model file for fold {fold_idx}: {model_path}")
 
-        X_val = X.iloc[val_idx]
-        pool_val = Pool(X_val, cat_features=cat_features_indices)
+            X_val = X.iloc[val_idx]
+            pool_val = Pool(X_val, cat_features=cat_features_indices)
 
-        if is_regression(task):
-            model = CatBoostRegressor()
-            model.load_model(model_path)
-            preds = model.predict(pool_val)
-        else:
-            model = CatBoostClassifier()
-            model.load_model(model_path)
-            if task == "multiclass_classification":
-                preds = model.predict_proba(pool_val)
+            if is_regression(task):
+                model = CatBoostRegressor()
+                model.load_model(model_path)
+                preds = model.predict(pool_val)
             else:
-                preds = model.predict_proba(pool_val)[:, 1]
+                model = CatBoostClassifier()
+                model.load_model(model_path)
+                if task == "multiclass_classification":
+                    preds = model.predict_proba(pool_val)
+                else:
+                    preds = model.predict_proba(pool_val)[:, 1]
 
-        oof_preds[val_idx] = preds
-        if transform_module is not None:
-            preds_bt = transform_module.output_transform(
-                np.asarray(preds, dtype=float), _fold_transform_meta[fold_idx],
-                tx_info.get("params", {}),
-                df_raw=df_raw, row_indices=val_idx
+            oof_preds[val_idx] = preds
+            if transform_module is not None:
+                preds_bt = transform_module.output_transform(
+                    np.asarray(preds, dtype=float), _fold_transform_meta[fold_idx],
+                    tx_info.get("params", {}),
+                    df_raw=df_raw, row_indices=val_idx
+                )
+                oof_preds[val_idx] = preds_bt
+            counts[val_idx] += 1
+
+        if np.any(counts == 0):
+            n_missing = int(np.sum(counts == 0))
+            raise RuntimeError(
+                f"{n_missing} rows were never predicted in OOF loop. "
+                f"CV fold structure may be corrupted."
             )
-            oof_preds[val_idx] = preds_bt
-        counts[val_idx] += 1
+        if np.any(counts > 1):
+            print("[WARNING] Some rows were predicted multiple times (counts>1).")
 
-    if np.any(counts == 0):
-        n_missing = int(np.sum(counts == 0))
-        raise RuntimeError(
-            f"{n_missing} rows were never predicted in OOF loop. "
-            f"CV fold structure may be corrupted."
-        )
-    if np.any(counts > 1):
-        print("[WARNING] Some rows were predicted multiple times (counts>1).")
+        # 6b. Inverse-transform multi-regression predictions if scaler exists
+        scaler_path = os.path.join(run_dir, "target_scaler.json")
+        if task == "multi_regression" and os.path.exists(scaler_path) and transform_module is None:
+            with open(scaler_path) as f:
+                scaler_info = json.load(f)
+            means = np.array(scaler_info["mean"])
+            scales = np.array(scaler_info["scale"])
+            oof_preds = oof_preds * scales + means
+            print("[INFO] Inverse-transformed predictions to original target scale")
 
-    # 6b. Inverse-transform multi-regression predictions if scaler exists
-    scaler_path = os.path.join(run_dir, "target_scaler.json")
-    if task == "multi_regression" and os.path.exists(scaler_path) and transform_module is None:
-        with open(scaler_path) as f:
-            scaler_info = json.load(f)
-        means = np.array(scaler_info["mean"])
-        scales = np.array(scaler_info["scale"])
-        oof_preds = oof_preds * scales + means
-        print("[INFO] Inverse-transformed predictions to original target scale")
+        # 8. Save Predictions
+        if task == "multiclass_classification":
+            pred_df = pd.DataFrame({id_col: ids})
+            pred_df["y_true"] = y.values
+            for i, cl in enumerate(class_labels):
+                pred_df[f"prob_{cl}"] = oof_preds[:, i]
+        elif task == "multi_regression":
+            pred_df = pd.DataFrame({id_col: ids})
+            for i, col in enumerate(outcome_cols):
+                pred_df[f"y_true_{col}"] = y.values[:, i]
+                pred_df[f"y_pred_{col}"] = oof_preds[:, i]
+        else:
+            pred_df = pd.DataFrame({id_col: ids, "y_pred": oof_preds, "y_true": y.values})
+        pred_df.to_csv(os.path.join(run_dir, "predictions_oof.csv"), index=False)
+
+        _update_predict_checkpoint("P1")
+    else:
+        pred_df = pd.read_csv(os.path.join(run_dir, "predictions_oof.csv"))
+        if task == "multiclass_classification":
+            prob_cols = [f"prob_{cl}" for cl in class_labels]
+            oof_preds = pred_df[prob_cols].values
+        elif task == "multi_regression":
+            pred_cols = [f"y_pred_{col}" for col in outcome_cols]
+            oof_preds = pred_df[pred_cols].values
+        else:
+            oof_preds = pred_df["y_pred"].values
+        print("[RESUME] P1 (OOF predictions): skipped (complete).")
 
     # 7. Metrics & Bootstrapping
-    print("\n--- OOF Performance (95% CI) ---")
+    if "P2" not in completed_phases:
+        print("\n--- OOF Performance (95% CI) ---")
 
-    # Select metrics based on task type
-    if task == "regression":
-        metrics_to_calc = ["neg_rmse", "neg_mae", "r2"]
-    elif task == "multi_regression":
-        metrics_to_calc = ["neg_rmse", "neg_mae", "r2"]
-    elif task == "multiclass_classification":
-        metrics_to_calc = ["balanced_accuracy", "f1_weighted"]
-    else:  # binary_classification
-        metrics_to_calc = ["roc_auc", "accuracy"]
+        # Select metrics based on task type
+        if task == "regression":
+            metrics_to_calc = ["neg_rmse", "neg_mae", "r2"]
+        elif task == "multi_regression":
+            metrics_to_calc = ["neg_rmse", "neg_mae", "r2"]
+        elif task == "multiclass_classification":
+            metrics_to_calc = ["balanced_accuracy", "f1_weighted"]
+        else:  # binary_classification
+            metrics_to_calc = ["roc_auc", "accuracy"]
 
-    boot_alpha = config["shap"]["bootstrapping"]["alpha"]
-    results = []
+        boot_alpha = config["shap"]["bootstrapping"]["alpha"]
+        results = []
+        boot_distributions = {}
 
-    if task == "multi_regression":
-        # Per-target bootstrapped CIs
-        y_vals = y.values
-        for t_idx, col in enumerate(outcome_cols):
+        if task == "multi_regression":
+            # Per-target bootstrapped CIs
+            y_vals = y.values
+            for t_idx, col in enumerate(outcome_cols):
+                for m_name in metrics_to_calc:
+                    fn = get_scoring_function(m_name)
+                    raw_score, raw_low, raw_high, raw_dist = compute_bootstrap_ci(
+                        y_vals[:, t_idx], oof_preds[:, t_idx], fn,
+                        n_boot=config["shap"]["bootstrapping"]["n_boot"],
+                        alpha=boot_alpha,
+                        return_distribution=True
+                    )
+                    if m_name.startswith("neg_"):
+                        score, low, high = -raw_score, -raw_high, -raw_low
+                        boot_distributions[f"{m_name.replace('neg_', '').upper()}_{col}"] = -raw_dist
+                    else:
+                        score, low, high = raw_score, raw_low, raw_high
+                        boot_distributions[f"{m_name.replace('neg_', '').upper()}_{col}"] = raw_dist
+                    disp_name = f"{m_name.replace('neg_', '').upper()}_{col}"
+                    print(f"  {disp_name}: {score:.4f} [{low:.4f}, {high:.4f}]")
+                    results.append({"metric": disp_name, "score": score, "ci_low": low, "ci_high": high})
+        elif task == "multiclass_classification":
+            # Multiclass: use argmax labels for hard metrics, proba for prob metrics
+            y_vals = y.values
+            preds_labels = np.argmax(oof_preds, axis=1)
             for m_name in metrics_to_calc:
                 fn = get_scoring_function(m_name)
-                raw_score, raw_low, raw_high = compute_bootstrap_ci(
-                    y_vals[:, t_idx], oof_preds[:, t_idx], fn,
+                raw_score, raw_low, raw_high, raw_dist = compute_bootstrap_ci(
+                    y_vals, preds_labels, fn,
                     n_boot=config["shap"]["bootstrapping"]["n_boot"],
-                    alpha=boot_alpha
+                    alpha=boot_alpha,
+                    return_distribution=True
                 )
+                score, low, high = raw_score, raw_low, raw_high
+                disp_name = m_name.upper()
+                boot_distributions[disp_name] = raw_dist
+                print(f"  {disp_name}: {score:.4f} [{low:.4f}, {high:.4f}]")
+                results.append({"metric": disp_name, "score": score, "ci_low": low, "ci_high": high})
+            # Also try AUC-OVR with probabilities
+            try:
+                from sklearn.metrics import roc_auc_score as _roc
+                auc_fn = lambda yt, yp: _roc(yt, yp, multi_class='ovr', average='weighted')
+                raw_score, raw_low, raw_high, raw_dist = compute_bootstrap_ci(
+                    y_vals, oof_preds, auc_fn,
+                    n_boot=config["shap"]["bootstrapping"]["n_boot"],
+                    alpha=boot_alpha,
+                    return_distribution=True
+                )
+                boot_distributions["ROC_AUC_OVR"] = raw_dist
+                print(f"  ROC_AUC_OVR: {raw_score:.4f} [{raw_low:.4f}, {raw_high:.4f}]")
+                results.append({"metric": "ROC_AUC_OVR", "score": raw_score, "ci_low": raw_low, "ci_high": raw_high})
+            except Exception:
+                print("  ROC_AUC_OVR: skipped (insufficient classes in bootstrap)")
+        else:
+            # regression or binary_classification
+            y_vals = y.values
+            for m_name in metrics_to_calc:
+                fn = get_scoring_function(m_name)
+                # Thresholding for classification hard metrics
+                if task == "binary_classification" and m_name in ["accuracy", "f1"]:
+                    fn = lambda yt, yp, _fn=fn: _fn(yt, (yp > 0.5).astype(int))
+
+                raw_score, raw_low, raw_high, raw_dist = compute_bootstrap_ci(
+                    y_vals, oof_preds, fn,
+                    n_boot=config["shap"]["bootstrapping"]["n_boot"],
+                    alpha=boot_alpha,
+                    return_distribution=True
+                )
+
                 if m_name.startswith("neg_"):
                     score, low, high = -raw_score, -raw_high, -raw_low
                 else:
                     score, low, high = raw_score, raw_low, raw_high
-                disp_name = f"{m_name.replace('neg_', '').upper()}_{col}"
-                print(f"  {disp_name}: {score:.4f} [{low:.4f}, {high:.4f}]")
+
+                disp_name = m_name.replace("neg_", "").upper()
+                if m_name.startswith("neg_"):
+                    boot_distributions[disp_name] = -raw_dist
+                else:
+                    boot_distributions[disp_name] = raw_dist
+                print(f"  {disp_name:<5}: {score:.4f} [{low:.4f}, {high:.4f}]")
                 results.append({"metric": disp_name, "score": score, "ci_low": low, "ci_high": high})
-    elif task == "multiclass_classification":
-        # Multiclass: use argmax labels for hard metrics, proba for prob metrics
-        y_vals = y.values
-        preds_labels = np.argmax(oof_preds, axis=1)
-        for m_name in metrics_to_calc:
-            fn = get_scoring_function(m_name)
-            raw_score, raw_low, raw_high = compute_bootstrap_ci(
-                y_vals, preds_labels, fn,
-                n_boot=config["shap"]["bootstrapping"]["n_boot"],
-                alpha=boot_alpha
-            )
-            score, low, high = raw_score, raw_low, raw_high
-            disp_name = m_name.upper()
-            print(f"  {disp_name}: {score:.4f} [{low:.4f}, {high:.4f}]")
-            results.append({"metric": disp_name, "score": score, "ci_low": low, "ci_high": high})
-        # Also try AUC-OVR with probabilities
-        try:
-            from sklearn.metrics import roc_auc_score as _roc
-            auc_fn = lambda yt, yp: _roc(yt, yp, multi_class='ovr', average='weighted')
-            raw_score, raw_low, raw_high = compute_bootstrap_ci(
-                y_vals, oof_preds, auc_fn,
-                n_boot=config["shap"]["bootstrapping"]["n_boot"],
-                alpha=boot_alpha
-            )
-            print(f"  ROC_AUC_OVR: {raw_score:.4f} [{raw_low:.4f}, {raw_high:.4f}]")
-            results.append({"metric": "ROC_AUC_OVR", "score": raw_score, "ci_low": raw_low, "ci_high": raw_high})
-        except Exception:
-            print("  ROC_AUC_OVR: skipped (insufficient classes in bootstrap)")
-    else:
-        # regression or binary_classification
-        y_vals = y.values
-        for m_name in metrics_to_calc:
-            fn = get_scoring_function(m_name)
-            # Thresholding for classification hard metrics
-            if task == "binary_classification" and m_name in ["accuracy", "f1"]:
-                fn = lambda yt, yp, _fn=fn: _fn(yt, (yp > 0.5).astype(int))
 
-            raw_score, raw_low, raw_high = compute_bootstrap_ci(
-                y_vals, oof_preds, fn,
-                n_boot=config["shap"]["bootstrapping"]["n_boot"],
-                alpha=boot_alpha
-            )
+        pd.DataFrame(results).to_csv(os.path.join(run_dir, "performance_final.csv"), index=False)
 
-            if m_name.startswith("neg_"):
-                score, low, high = -raw_score, -raw_high, -raw_low
-            else:
-                score, low, high = raw_score, raw_low, raw_high
+        if boot_distributions:
+            max_len = max(len(v) for v in boot_distributions.values())
+            boot_df = pd.DataFrame({
+                k: np.pad(v, (0, max_len - len(v)), constant_values=np.nan)
+                for k, v in boot_distributions.items()
+            })
+            boot_df.to_parquet(os.path.join(run_dir, "bootstrap_distributions_perf.parquet"), index=False)
+            print(f"[INFO] Saved bootstrap_distributions_perf.parquet ({len(boot_distributions)} metrics, {max_len} samples)")
 
-            disp_name = m_name.replace("neg_", "").upper()
-            print(f"  {disp_name:<5}: {score:.4f} [{low:.4f}, {high:.4f}]")
-            results.append({"metric": disp_name, "score": score, "ci_low": low, "ci_high": high})
+        # 7b. Permutation Test (Null Model Comparison)
+        print("\n--- Permutation Test (Model vs Chance) ---")
 
-    pd.DataFrame(results).to_csv(os.path.join(run_dir, "performance_final.csv"), index=False)
+        n_perm = max(config["shap"]["bootstrapping"]["n_boot"], 1000)
+        seed = config["execution"]["random_seed"]
 
-    # 7b. Permutation Test (Null Model Comparison)
-    print("\n--- Permutation Test (Model vs Chance) ---")
-
-    n_perm = max(config["shap"]["bootstrapping"]["n_boot"], 1000)
-    seed = config["execution"]["random_seed"]
-
-    if task == "multi_regression":
-        # Run permutation test per target
-        for t_idx, col in enumerate(outcome_cols):
-            perm_fns = [get_scoring_function(m) for m in metrics_to_calc]
-            perm_results = compute_permutation_test(
-                y.values[:, t_idx], oof_preds[:, t_idx],
-                perm_fns, metrics_to_calc, n_perm, seed, run_dir
-            )
-            for _, row in perm_results.iterrows():
-                sig = "*" if row["p_value"] < boot_alpha else ""
-                print(f"  {col}/{row['metric']}: observed={row['observed']:.4f}, p={row['p_value']:.4f} {sig}")
-    else:
-        # For multiclass, use argmax labels for permutation test
-        if task == "multiclass_classification":
-            perm_preds = np.argmax(oof_preds, axis=1)
+        if task == "multi_regression":
+            # Run permutation test per target
+            for t_idx, col in enumerate(outcome_cols):
+                perm_fns = [get_scoring_function(m) for m in metrics_to_calc]
+                perm_results = compute_permutation_test(
+                    y.values[:, t_idx], oof_preds[:, t_idx],
+                    perm_fns, metrics_to_calc, n_perm, seed, run_dir
+                )
+                for _, row in perm_results.iterrows():
+                    sig = "*" if row["p_value"] < boot_alpha else ""
+                    print(f"  {col}/{row['metric']}: observed={row['observed']:.4f}, p={row['p_value']:.4f} {sig}")
         else:
-            perm_preds = oof_preds
+            # For multiclass, use argmax labels for permutation test
+            if task == "multiclass_classification":
+                perm_preds = np.argmax(oof_preds, axis=1)
+            else:
+                perm_preds = oof_preds
 
-        perm_fns = []
-        perm_names = []
-        for m_name in metrics_to_calc:
-            fn = get_scoring_function(m_name)
-            if task == "binary_classification" and m_name in ["accuracy", "f1"]:
-                fn = lambda yt, yp, _fn=fn: _fn(yt, (yp > 0.5).astype(int))
-            perm_fns.append(fn)
-            perm_names.append(m_name)
+            perm_fns = []
+            perm_names = []
+            for m_name in metrics_to_calc:
+                fn = get_scoring_function(m_name)
+                if task == "binary_classification" and m_name in ["accuracy", "f1"]:
+                    fn = lambda yt, yp, _fn=fn: _fn(yt, (yp > 0.5).astype(int))
+                perm_fns.append(fn)
+                perm_names.append(m_name)
 
-        perm_results = compute_permutation_test(
-            y_vals, perm_preds, perm_fns, perm_names, n_perm, seed, run_dir
-        )
+            perm_results = compute_permutation_test(
+                y_vals, perm_preds, perm_fns, perm_names, n_perm, seed, run_dir
+            )
 
-        for _, row in perm_results.iterrows():
-            sig_marker = "*" if row["p_value"] < boot_alpha else ""
-            print(f"  {row['metric']:<5}: observed={row['observed']:.4f}, "
-                  f"null={row['null_mean']:.4f} +/- {row['null_std']:.4f}, "
-                  f"p={row['p_value']:.4f} {sig_marker}")
+            for _, row in perm_results.iterrows():
+                sig_marker = "*" if row["p_value"] < boot_alpha else ""
+                print(f"  {row['metric']:<5}: observed={row['observed']:.4f}, "
+                      f"null={row['null_mean']:.4f} +/- {row['null_std']:.4f}, "
+                      f"p={row['p_value']:.4f} {sig_marker}")
 
-    # 8. Save Predictions
-    if task == "multiclass_classification":
-        pred_df = pd.DataFrame({id_col: ids})
-        pred_df["y_true"] = y.values
-        for i, cl in enumerate(class_labels):
-            pred_df[f"prob_{cl}"] = oof_preds[:, i]
-    elif task == "multi_regression":
-        pred_df = pd.DataFrame({id_col: ids})
-        for i, col in enumerate(outcome_cols):
-            pred_df[f"y_true_{col}"] = y.values[:, i]
-            pred_df[f"y_pred_{col}"] = oof_preds[:, i]
+        _update_predict_checkpoint("P2")
     else:
-        pred_df = pd.DataFrame({id_col: ids, "y_pred": oof_preds, "y_true": y.values})
-    pred_df.to_csv(os.path.join(run_dir, "predictions_oof.csv"), index=False)
+        print("[RESUME] P2 (metrics & bootstrap): skipped (complete).")
 
     # 9. Trigger SHAP (With OOF & Metadata Context)
-    print("\n[INFO] Starting SHAP Pipeline (OOF Mode)...")
-
-    shap_ctx = {
-        "run_dir": run_dir,
-        "config": config,
-        "task": task,
-        "feature_names": trained_features,
-        "feature_names_shadow": shadow_features,
-        "cat_features": nom_feats,
-        "feature_types": feature_types,
-        "X": X,
-        "y": y,
-        "X_raw": X_raw,
-        "ids": ids,
-        "class_labels": class_labels,
-        "target_labels": target_labels,
-    }
-
     cv_strategy = config["modeling"].get("cv_strategy", "uniform")
     group_column = config["modeling"].get("group_column")
-    if cv_strategy == "group" and group_column is not None and group_column in df_raw.columns:
-        shap_ctx["groups"] = df_raw[group_column].values
-        shap_ctx["cv_strategy"] = cv_strategy
 
-    if fold_shap_scale_factors is not None:
-        shap_ctx["fold_shap_scale_factors"] = fold_shap_scale_factors
+    if "P3" not in completed_phases:
+        print("\n[INFO] Starting SHAP Pipeline (OOF Mode)...")
 
-    run_shap_pipeline(shap_ctx)
+        shap_ctx = {
+            "run_dir": run_dir,
+            "config": config,
+            "task": task,
+            "feature_names": trained_features,
+            "feature_names_shadow": shadow_features,
+            "cat_features": nom_feats,
+            "feature_types": feature_types,
+            "X": X,
+            "y": y,
+            "X_raw": X_raw,
+            "ids": ids,
+            "class_labels": class_labels,
+            "target_labels": target_labels,
+        }
+
+        if cv_strategy == "group" and group_column is not None and group_column in df_raw.columns:
+            shap_ctx["groups"] = df_raw[group_column].values
+            shap_ctx["cv_strategy"] = cv_strategy
+
+        if fold_shap_scale_factors is not None:
+            shap_ctx["fold_shap_scale_factors"] = fold_shap_scale_factors
+
+        run_shap_pipeline(shap_ctx)
+
+        _update_predict_checkpoint("P3")
+    else:
+        print("[RESUME] P3 (SHAP pipeline): skipped (complete).")
 
     # --- Per-individual SHAP reports (indiv_reports) ---
     validate_indiv_reports_config(config)
@@ -519,57 +624,73 @@ def main():
             tx_module_path = resolve_transform_path(config)
             _outcome_col_boot = outcome_cols[0] if len(outcome_cols) == 1 else outcome_cols
 
-        # 1. Build cache at run_dir/bootstrap_refits/
-        cache_summary = orchestrate_bootstrap_cache(
-            run_dir=run_dir,
-            X_train=X,
-            y_train=y,
-            task=task,
-            outcome_cols=outcome_cols,
-            nom_feats=nom_feats,
-            config=config,
-            n_jobs=n_jobs,
-            random_seed=config["execution"]["random_seed"],
-            cluster_ids=cluster_ids_indiv,
-            transform_module_path=tx_module_path,
-            tx_params=tx_info.get("params", {}) if tx_info is not None else None,
-            df_raw=df_raw if transform_module is not None else None,
-            outcome_col=_outcome_col_boot,
-            back_transform_shap=tx_info.get("back_transform_shap", False) if tx_info else False,
-            is_affine=tx_info.get("is_affine", False) if tx_info else False,
-        )
-        print(
-            f"[INFO] Bootstrap cache built: B={cache_summary['B']} iterations "
-            f"across K={cache_summary['K']} folds "
-            f"({cache_summary['total_refits']} total refits)."
-        )
+        if "P4" not in completed_phases:
+            # 1. Build cache at run_dir/bootstrap_refits/
+            cache_summary = orchestrate_bootstrap_cache(
+                run_dir=run_dir,
+                X_train=X,
+                y_train=y,
+                task=task,
+                outcome_cols=outcome_cols,
+                nom_feats=nom_feats,
+                config=config,
+                n_jobs=n_jobs,
+                random_seed=config["execution"]["random_seed"],
+                cluster_ids=cluster_ids_indiv,
+                transform_module_path=tx_module_path,
+                tx_params=tx_info.get("params", {}) if tx_info is not None else None,
+                df_raw=df_raw if transform_module is not None else None,
+                outcome_col=_outcome_col_boot,
+                back_transform_shap=tx_info.get("back_transform_shap", False) if tx_info else False,
+                is_affine=tx_info.get("is_affine", False) if tx_info else False,
+            )
+            print(
+                f"[INFO] Bootstrap cache built: B={cache_summary['B']} iterations "
+                f"across K={cache_summary['K']} folds "
+                f"({cache_summary['total_refits']} total refits)."
+            )
+            _update_predict_checkpoint("P4")
+        else:
+            print("[RESUME] P4 (bootstrap cache): skipped (complete).")
 
-        # 2. Emit training-individual indiv_reports
-        sig_GII_main, sig_GII_interaction = _load_sig_GII_from_shap_stats(run_dir)
-        generate_indiv_reports(
-            run_dir=run_dir,
-            train_dir=run_dir,  # in predict.py, train_dir == run_dir
-            X_target=X,
-            ids_target=ids,
-            X_train=X,
-            y_target=y,
-            task=task,
-            outcome_cols=outcome_cols,
-            nom_feats=nom_feats,
-            config=config,
-            mode="training",
-            sig_GII_main=sig_GII_main,
-            sig_GII_interaction=sig_GII_interaction,
-            cluster_ids=cluster_ids_indiv,
-            transform_module=transform_module,
-            fold_transform_metadata=_fold_transform_meta if transform_module is not None else None,
-            tx_params=tx_info.get("params", {}) if tx_info is not None else None,
-            df_raw=df_raw,
-            fold_shap_scale_factors=fold_shap_scale_factors,
-        )
-        print(f"[INFO] Training indiv_reports/ emitted to {run_dir}.")
+        if "P5" not in completed_phases:
+            # 2. Emit training-individual indiv_reports
+            sig_GII_main, sig_GII_interaction = _load_sig_GII_from_shap_stats(run_dir)
+            generate_indiv_reports(
+                run_dir=run_dir,
+                train_dir=run_dir,  # in predict.py, train_dir == run_dir
+                X_target=X,
+                ids_target=ids,
+                X_train=X,
+                y_target=y,
+                task=task,
+                outcome_cols=outcome_cols,
+                nom_feats=nom_feats,
+                config=config,
+                mode="training",
+                sig_GII_main=sig_GII_main,
+                sig_GII_interaction=sig_GII_interaction,
+                cluster_ids=cluster_ids_indiv,
+                transform_module=transform_module,
+                fold_transform_metadata=_fold_transform_meta if transform_module is not None else None,
+                tx_params=tx_info.get("params", {}) if tx_info is not None else None,
+                df_raw=df_raw,
+                fold_shap_scale_factors=fold_shap_scale_factors,
+            )
+            print(f"[INFO] Training indiv_reports/ emitted to {run_dir}.")
+            _update_predict_checkpoint("P5")
+        else:
+            print("[RESUME] P5 (individual reports): skipped (complete).")
     else:
+        for p in ["P4", "P5"]:
+            if p not in existing_checkpoint["progress"].get("skipped_phases", []):
+                existing_checkpoint["progress"].setdefault("skipped_phases", []).append(p)
+        save_checkpoint(existing_checkpoint, checkpoint_path)
         print("[INFO] shap.indiv_ci_nboot=0; skipping per-individual SHAP reports.")
+
+    existing_checkpoint["status"] = "complete"
+    existing_checkpoint["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    save_checkpoint(existing_checkpoint, checkpoint_path)
 
 if __name__ == "__main__":
     main()
