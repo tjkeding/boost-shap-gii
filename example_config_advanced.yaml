@@ -156,5 +156,8 @@ plot:
 
   bootstrap_ribbons:
     n_boot: 2000           # Bootstrap resamples for uncertainty ribbons on V-component plots (default: 2000)
+    max_subsample_n: 5000  # Cap on data points per bootstrap spline fit; larger datasets are
+                           # subsampled with m-out-of-n correction (Bickel & Sakov 2008). Set to
+                           # null to disable subsampling and use all data. (default: 5000)
 
   max_interaction_strata: 3  # Maximum moderator strata for interaction plots (default: 3)

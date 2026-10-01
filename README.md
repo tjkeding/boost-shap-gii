@@ -269,7 +269,7 @@ One density subplot per reported metric (e.g., RMSE, MAE, R²), each contrasting
 Each significant effect (features passing `sig_GII` or `sig_V` under the two-tier ranking; V-only effects use a `_Vsig` suffix and rank by `V` rather than `GII`) renders as a two-panel figure:
 
 - **M-panel** (density, main effects only — omitted for V-only effects): overlapping noise/signal SHAP-magnitude densities. The legend embeds each distribution's `mean (SD)` directly into its "Noise"/"Signal" entry (bold label, smaller-font stat), avoiding the panel-boundary label-collision problems that spatial annotations produce when the two distributions sit close together.
-- **V-panel** (scatter/trend): SHAP value vs. feature value. Continuous focal features render a per-observation scatter with an adaptive-knot spline trend and a bootstrap standard-deviation ribbon; discrete focal features (nominal/ordinal/binary, or low-cardinality continuous) render jittered points with per-level group means and bootstrap SD error bars. Long category names (after underscore-to-newline conversion) wrap onto multiple lines rather than overlapping horizontally.
+- **V-panel** (scatter/trend): SHAP value vs. feature value. Continuous focal features render a per-observation scatter with an adaptive-knot spline trend and a bootstrap standard-deviation ribbon; discrete focal features (nominal/ordinal/binary, or low-cardinality continuous) render jittered points with per-level group means and standard-error bars (analytical SE of the level mean). Long category names (after underscore-to-newline conversion) wrap onto multiple lines rather than overlapping horizontally.
 
 Interaction effects additionally render **both moderator orientations** (`_mod_<partner>.png` suffix on each), coloring points by the moderator's stratum. Moderator strata are capped at `plot.max_interaction_strata` (default 3): nominal moderators keep the top-contributing levels by V-contribution rank, ordinal/continuous moderators fall back to quantile binning when their natural level count exceeds the cap.
 
@@ -281,10 +281,11 @@ See `INPUT_SPECIFICATION.md` Section 10 for the algorithmic description of per-i
 
 | Key | Type | Required | Description |
 |---|---|---|---|
-| `plot.bootstrap_ribbons.n_boot` | integer | No (default `2000`) | Bootstrap resamples used to compute the V-panel's spline/group-mean standard-deviation ribbons and error bars. |
+| `plot.bootstrap_ribbons.n_boot` | integer | No (default `2000`) | Bootstrap resamples used to compute the V-panel's spline standard-deviation ribbons (continuous focal features). |
+| `plot.bootstrap_ribbons.max_subsample_n` | integer or `null` | No (default `5000`, must be ≥ 10) | Cap on observations per bootstrap spline refit. Larger inputs are subsampled and the ribbon SD is rescaled by `sqrt(m / n)` (m-out-of-n bootstrap). Set to `null` to disable subsampling and resample all observations. |
 | `plot.max_interaction_strata` | integer | No (default `3`, must be ≥ 2) | Maximum number of moderator strata shown per interaction plot. |
 
-See `INPUT_SPECIFICATION.md` Section 2 (`plot`) for the full set of required `plot.*` keys (`outcome_max`, `negate_shap`, `gii_y_label`, `gii_y_sublabel`, `indiv_y_label`, `indiv_y_sublabel`).
+See `INPUT_SPECIFICATION.md` Section 2 (`plot`) for the full set of required `plot.*` keys (`outcome_max`, `negate_shap`, `gii_y_label`, `gii_y_sublabel`, `indiv_y_label`, `indiv_y_sublabel`). Setting either sublabel to an empty string `""` suppresses that subtitle. The required keys and `plot.bootstrap_ribbons.max_subsample_n` are validated before `plot.R` is launched.
 
 ---
 

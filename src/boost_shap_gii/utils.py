@@ -869,8 +869,10 @@ def validate_plot_config(config: dict) -> None:
     Raises ValueError with precise messages on missing or wrong-typed keys:
       - plot.outcome_max missing or non-positive number
       - plot.negate_shap missing or not bool
-      - plot.gii_y_label / plot.gii_y_sublabel / plot.indiv_y_label / plot.indiv_y_sublabel
-        missing or empty string
+      - plot.gii_y_label / plot.indiv_y_label missing or empty string
+      - plot.gii_y_sublabel / plot.indiv_y_sublabel missing or not a string ("" suppresses)
+      - plot.bootstrap_ribbons not a mapping, or plot.bootstrap_ribbons.max_subsample_n
+        present but neither null nor an integer >= 10
     """
     plot_cfg = config.get("plot", {})
 
@@ -898,12 +900,10 @@ def validate_plot_config(config: dict) -> None:
             f"plot.negate_shap must be a bool (true/false), got {type(negate_shap).__name__}: {negate_shap!r}."
         )
 
-    # -- label strings --
+    # -- label strings (must be non-empty) --
     required_labels = [
         ("gii_y_label", "plot.gii_y_label"),
-        ("gii_y_sublabel", "plot.gii_y_sublabel"),
         ("indiv_y_label", "plot.indiv_y_label"),
-        ("indiv_y_sublabel", "plot.indiv_y_sublabel"),
     ]
     for key, dotted in required_labels:
         val = plot_cfg.get(key)
@@ -914,6 +914,40 @@ def validate_plot_config(config: dict) -> None:
         if not isinstance(val, str) or not val.strip():
             raise ValueError(
                 f"{dotted} must be a non-empty string, got {val!r}."
+            )
+
+    # -- sublabel strings (required; "" suppresses the subtitle) --
+    required_sublabels = [
+        ("gii_y_sublabel", "plot.gii_y_sublabel"),
+        ("indiv_y_sublabel", "plot.indiv_y_sublabel"),
+    ]
+    for key, dotted in required_sublabels:
+        val = plot_cfg.get(key)
+        if val is None:
+            raise ValueError(
+                f"{dotted} is required for the plot subcommand but is missing from config."
+            )
+        if not isinstance(val, str):
+            raise ValueError(
+                f"{dotted} must be a string (use \"\" to suppress), got {val!r}."
+            )
+
+    # -- plot.bootstrap_ribbons.max_subsample_n (optional) --
+    # Absent: plot.R defaults to 5000. Explicit null: subsampling disabled.
+    # Integer: must be >= 10 (plot.R MIN_BOOT_N; below this every resample is skipped).
+    ribbons_cfg = plot_cfg.get("bootstrap_ribbons") or {}
+    if not isinstance(ribbons_cfg, dict):
+        raise ValueError(
+            f"plot.bootstrap_ribbons must be a mapping, got {ribbons_cfg!r}."
+        )
+    if "max_subsample_n" in ribbons_cfg:
+        msn = ribbons_cfg["max_subsample_n"]
+        if msn is not None and (
+            isinstance(msn, bool) or not isinstance(msn, int) or msn < 10
+        ):
+            raise ValueError(
+                "plot.bootstrap_ribbons.max_subsample_n must be null (disable subsampling) "
+                f"or an integer >= 10, got {msn!r}."
             )
 
 

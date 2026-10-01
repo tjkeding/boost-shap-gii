@@ -47,7 +47,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 
 3. **Implement (Plan + Build)** -- Implementation proceeded in two sub-phases: (a) a technical specification mapping each approved change to specific code modifications with risk assessment, and (b) execution of the specification. All plans required human approval before code generation began.
 
-4. **Test** -- Comprehensive test suite development (895 tests across 35 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
+4. **Test** -- Comprehensive test suite development (1105 tests across 49 test files) covering unit, integration, edge-case, and statistical invariant tests. Tests were designed prior to implementation where feasible (test-first methodology).
 
 5. **Clean** -- Code quality review for consistency, style, and maintainability.
 
@@ -56,7 +56,7 @@ The pipeline was developed through an iterative, mode-based workflow with the fo
 Key properties of this workflow:
 
 - All decisions required **explicit human approval** before implementation.
-- The pipeline was developed with a **test-first** approach; 895 tests validate statistical correctness, edge-case handling, and integration behavior.
+- The pipeline was developed with a **test-first** approach; 1105 tests validate statistical correctness, edge-case handling, and integration behavior.
 - Every statistical and algorithmic choice was subjected to **formal critical review**, with findings documented and triaged individually.
 
 ## 5. Human Oversight
@@ -632,7 +632,112 @@ LLM tool use carries no claim to scientific credit under project policy. All des
 
 ---
 
+### Session 2026-09-29 -- Fork-safe plot rendering and V-panel uncertainty-overlay corrections
+
+**Session scope:**
+
+- **Fork-safety restructure of the GII plotting loop**: a post-release plotting run was found to hang indefinitely after the model-performance panel rendered when `plot.R` executed with multiple forked `foreach %dopar%` workers. Diagnosis attributed the hang to graphics-device and Rcpp-backed (`ggtext`) rendering state inherited by forked workers. The loop was restructured into a compute-parallel/render-sequential design: Phase 1 `%dopar%` workers now return data-only structured lists (no `ggplot`, `ggsave()`, or `ggtext` calls); Phase 2 is a sequential loop in the parent R process that builds every plot object and writes every file.
+- **m-out-of-n subsampling for spline SD ribbons**: `bootstrap_spline_sd()` now draws a single without-replacement subsample of size `m` when the number of valid observations `n` exceeds a cap, resamples from it, and rescales the pointwise SD by `sqrt(m / n)` (Politis, Romano, & Wolf 1999; Bickel & Sakov 2008). New config key `plot.bootstrap_ribbons.max_subsample_n` (default 5000).
+- **Analytical standard error for discrete group means**: the per-level resampling helper `bootstrap_group_mean_sd()` was replaced by `group_mean_sd()`, which returns the analytical standard error `sd(y) / sqrt(n)` of each level's mean (Efron 1979), removing a resampling loop whose result converges to the same quantity.
+
+**LLM tools used:**
+
+- Claude Opus 5.5 (Anthropic): used for the diagnostic brainstorm session and implementation plan structuring.
+- Claude Sonnet 5 (Anthropic): used for implementation build execution and test design and execution.
+
+LLM tool use carries no claim to scientific credit under project policy. The compute-parallel/render-sequential architecture was selected by the researcher from competing alternatives during the brainstorm phase; the subsampling correction and the analytical-SE replacement were approved by the researcher on statistical grounds before implementation.
+
+**Key decisions (researcher-approved):**
+
+- *Compute-parallel/render-sequential over fully sequential plotting*: retains parallelism for the computationally dominant spline refits while confining all rendering to the parent process.
+- *m-out-of-n rescaling rather than an uncorrected subsample*: an uncorrected size-`m` bootstrap would overstate ribbon width by a factor of `sqrt(n / m)`; the rescaling restores the full-sample scale under root-n convergence.
+- *Analytical SE for group means*: the bootstrap SE of a sample mean converges to `sd / sqrt(n)`, so the resampling loop added computational cost and Monte Carlo noise without additional information.
+
+**Test metrics:**
+
+- Pre-session (Session 2026-09-24 baseline): 1068 tests (1068 passing, 0 failing).
+- Post-session: 1068 tests (1068 passing, 0 failing); 15 pre-design failures, all dispositioned obsolete-test (literal-string drift from the Phase 1/Phase 2 data-structure threading plus the approved helper rename), each re-expressed without weakening; 0 product bugs.
+
+**Audit trail references (.aid/reports/):**
+
+- Brainstorm: `boost-shap-gii_brainstorm_20260929_134500.md`
+- Implementation plan: `boost-shap-gii_implement_plan_20260929_140000.md`
+- Implementation build: `boost-shap-gii_implement_build_20260929_183400.md`
+- Test report: `boost-shap-gii_test_20260929_191500.md`
+
+---
+
+### Session 2026-10-01 -- Sequential per-individual rendering; subsampling-cap and sublabel contract fixes
+
+**Session scope:**
+
+- **Sequential per-individual rendering**: the fork-safety rationale from Session 2026-09-29 was extended to the per-individual plot path. `render_indiv_main_effects_plots()` and `render_indiv_interactions_plots()` previously dispatched rendering through forked `parallel::mclapply` workers; both now run a single sequential loop in the parent R process, with each individual wrapped in its own error handler so one rendering failure is logged without aborting the remaining individuals. The `n_cores` argument is retained in both signatures for call-site compatibility and is unused.
+- **Explicit-null handling for `max_subsample_n`**: `plot.R` previously applied a null-coalescing default that could not distinguish an explicit `max_subsample_n: null` from an absent key, so `null` silently became 5000. The key's presence is now tested directly: explicit `null` disables subsampling; an absent key defaults to 5000.
+- **Python-side validation of `plot.bootstrap_ribbons`**: `validate_plot_config()` now rejects a non-mapping `bootstrap_ribbons` value and any `max_subsample_n` that is neither `null` nor an integer `>= 10` (booleans, floats, and strings rejected), failing before `plot.R` is launched.
+- **Sublabel suppression contract**: `plot.gii_y_sublabel` and `plot.indiv_y_sublabel` remain required but now accept an empty or whitespace-only string to suppress the subtitle (previously rejected by validation despite being documented as the suppression mechanism). The GII y-axis label grob now collapses to the bare title when the sublabel is empty, matching the per-individual plots, instead of reserving a blank subtitle column.
+
+**LLM tools used:**
+
+- Claude Opus 5.5 (Anthropic): used for implementation plan structuring and this documentation pass.
+- Claude Sonnet 5 (Anthropic): used for implementation build execution and test design and execution.
+
+LLM tool use carries no claim to scientific credit under project policy. The choice of fully sequential (rather than partially parallel) per-individual rendering, the null-versus-absent semantics for `max_subsample_n`, the validation floor of 10, and the sublabel suppression contract were each specified or approved by the researcher before implementation.
+
+**Key decisions (researcher-approved):**
+
+- *Fully sequential per-individual rendering*: per-individual data preparation is a filter, a sort, and sign flips, so parallelizing it would still fork the process for negligible wall-clock benefit.
+- *Validation floor equal to `MIN_BOOT_N`*: a cap below 10 would cause every bootstrap resample to be skipped, producing silently empty ribbons.
+- *Whole-valued floats rejected*: R's `sample()` would silently truncate a non-integer cap, so only true integers are accepted.
+
+**Test metrics:**
+
+- Pre-session (Session 2026-09-29 baseline): 1068 tests (1068 passing, 0 failing).
+- After the per-individual restructure: 1079 tests (1079 passing, 0 failing); 11 new tests covering the removal of forked dispatch, per-individual error isolation, empty-individual skip logging, and multiclass per-class file emission.
+- Post-session: 1105 tests across 49 test files (1105 passing, 0 failing); 4 pre-design failures, all dispositioned obsolete-test against the approved sublabel contract change and re-expressed without weakening (the label-key cases retained; new acceptance tests added for the sublabel keys); 26 further new tests covering the `max_subsample_n` null/absent/integer resolution in R, the Python accept/reject matrix, sublabel acceptance, and the GII y-axis grob collapse; 0 product bugs.
+
+**Audit trail references (.aid/reports/):**
+
+- Implementation plans: `boost-shap-gii_implement_plan_20261001_100000.md`, `boost-shap-gii_implement_plan_20261001_100226.md`
+- Implementation builds: `boost-shap-gii_implement_build_20261001_073926.md`, `boost-shap-gii_implement_build_20261001_101141.md`
+- Test reports: `boost-shap-gii_test_20261001_092900.md`, `boost-shap-gii_test_20261001_143511.md`
+
+---
+
 ## 8. Version and Release Notes
+
+### Version 1.7.0 -- 2026-09-24 (Visualization overhaul, checkpoint/resume infrastructure)
+
+Feature release spanning Sessions 2026-09-17 through 2026-09-24. Adds a comprehensive visualization feature set and crash-safe pipeline resumption.
+
+- **Dual-source microdata dispatch**: significance scope expanded from `sig_GII`-only to `sig_GII | sig_V` (two-tier ranking). V-only-significant effects use a dedicated `microdata_V.parquet` source with a `_Vsig` filename suffix.
+- **Both moderator orientations for interaction plots**: each interacting feature is plotted as the focal axis with the other as moderator, producing two files per interaction pair.
+- **Per-stratum V splines and bootstrap SD ribbons**: continuous interaction V-panel overlays now render per-stratum splines with bootstrap standard-deviation ribbons (`plot.bootstrap_ribbons.n_boot`, default 2000). Discrete focal features show bootstrap SD error bars.
+- **Stat-label and legend redesign**: model performance panel distributions renamed "Permutation Null" / "Trained"; stat labels positioned below distributions with a compact `"mean (SD)"` format; M-panel statistics embedded directly in the legend via `ggtext::element_markdown()`, eliminating spatial-annotation collision problems; interaction legends use ascending natural order.
+- **V-panel label wrapping**: multi-word discrete category names are wrapped at underscores onto separate lines, keeping axis labels horizontal.
+- **Interaction visual tuning**: `max_interaction_strata` default reduced from 5 to 3; all crossing-line computation removed as dead code; dot alpha, mean-box, connecting-line, and error-bar styling refined across three user visual-critique cycles.
+- **Checkpoint/resume infrastructure**: per-stage JSON checkpoint files (`_checkpoint_train.json`, `_checkpoint_predict.json`, `_checkpoint_infer.json`) enable crash-safe resumption. Train resumes at fold granularity (five-artifact completion predicate); predict and infer resume at phase granularity. Config-hash validation (SHA-256 on stage-scoped config sections) invalidates stale checkpoints. Predecessor-mtime guards cascade invalidation across stages.
+- **Bootstrap refit cache skip**: `indiv_reports.py` scans for existing refit files before dispatch, skipping completed `(b, k)` pairs and reconstructing alpha values from per-refit sidecar files.
+- **`--force-restart` CLI flag**: added to `train`, `predict`, and `infer` subcommands; deletes the current stage's checkpoint without cascade.
+- **`ggtext` dependency**: declared in `check_env.py` and `environment.yaml`.
+- **Documentation**: README.md and INPUT_SPECIFICATION.md updated with checkpoint/resume infrastructure documentation and CLI flag reference.
+- **Tests**: post-session total 1068 tests (1068 passing, 0 failing).
+
+---
+
+### Version 1.8.0 -- 2026-10-01 (Fork-safe plot rendering, bootstrap subsampling, analytical SE)
+
+Feature release spanning Sessions 2026-09-29 through 2026-10-01. Eliminates fork-unsafe graphics and Rcpp execution in parallel workers; adds m-out-of-n bootstrap subsampling for large-dataset efficiency; replaces bootstrap discrete error bars with exact analytical standard errors.
+
+- **Fork-safe compute-parallel / render-sequential restructure**: the `foreach %dopar%` loop in `plot.R` is split into Phase 1 (data-only parallel computation returning structured lists) and Phase 2 (sequential rendering in the parent process). Phase 1 workers no longer construct ggplot objects, call `ggsave()`, or execute Rcpp code (`ggtext::element_markdown()`). The `.packages` vector is reduced from 7 to 3.
+- **Sequential per-individual rendering**: `render_indiv_main_effects_plots` and `render_indiv_interactions_plots` replace the forked `mclapply` dispatch with a sequential loop. Each individual is wrapped in `tryCatch` for error isolation; individuals with no matching rows are skipped with a logged `[INFO] [SKIP]` message.
+- **m-out-of-n bootstrap subsampling**: `bootstrap_spline_sd` subsamples to `min(n, max_subsample_n)` before the bootstrap loop and applies a `sqrt(m/n)` SD correction (Politis, Romano, Wolf 1999; Bickel, Sakov 2008). New config key `plot.bootstrap_ribbons.max_subsample_n` (integer or null; default 5000; minimum 10; null disables subsampling). The reference spline continues to use all data.
+- **Analytical SE for discrete error bars**: `bootstrap_group_mean_sd` (replicate-based) replaced by `group_mean_sd` using the closed-form `sd(y) / sqrt(n)` (Efron 1979). Zero computational cost; exact result.
+- **Sublabel suppression**: `plot.gii_y_sublabel` and `plot.indiv_y_sublabel` accept empty strings to suppress the y-axis subtitle. `validate_plot_config` relaxed accordingly. The GII y-axis grob collapses to a bare title `textGrob` when the sublabel is empty.
+- **Python-side validation updates**: `validate_plot_config` now validates `max_subsample_n` (type, range floor matching `MIN_BOOT_N`, null-versus-absent semantics) and rejects non-mapping `bootstrap_ribbons` values.
+- **Documentation**: README.md and INPUT_SPECIFICATION.md updated for all new features. `plot.R` comment-only additions documenting fork-safety rationale and per-individual retained-but-unused `n_cores` parameter.
+- **Tests**: post-session total 1105 tests across 49 test files (1105 passing, 0 failing).
+
+---
 
 ### Version 1.7.0 -- 2026-09-24 (Visualization overhaul, checkpoint/resume infrastructure)
 
